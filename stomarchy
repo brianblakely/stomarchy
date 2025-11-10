@@ -79,7 +79,8 @@ cmd_backup() {
     fi
     
     # Create timestamped backup
-    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
     local backup_path="${BACKUP_DIR}/${timestamp}"
     mkdir -p "$backup_path"
     
@@ -113,7 +114,12 @@ cmd_restore() {
     if [ ! -d "$backup_path" ]; then
         log_error "Backup not found: $backup_path"
         log_info "Available backups:"
-        ls -1 "$BACKUP_DIR" 2>/dev/null | grep -v "^latest$" || echo "  (none)"
+        # List backups excluding 'latest'
+        for backup in "$BACKUP_DIR"/*; do
+            [ -e "$backup" ] || continue
+            backup_name=$(basename "$backup")
+            [ "$backup_name" != "latest" ] && echo "  $backup_name"
+        done
         exit 1
     fi
     
@@ -125,7 +131,7 @@ cmd_restore() {
     
     # Process each config file
     while IFS= read -r -d '' backup_file; do
-        rel_path="${backup_file#$backup_path/}"
+        rel_path="${backup_file#"$backup_path"/}"
         target_file="${OMARCHY_DIR}/${rel_path}"
         custom_file="${STOMARCHY_DIR}/custom/${rel_path}"
         
@@ -155,9 +161,11 @@ cmd_restore() {
                 
                 # Add directive if not already present
                 if ! grep -Fq "$custom_file" "$target_file" 2>/dev/null; then
-                    echo "" >> "$target_file"
-                    echo "# Stomarchy customizations" >> "$target_file"
-                    echo "$source_directive" >> "$target_file"
+                    {
+                        echo ""
+                        echo "# Stomarchy customizations"
+                        echo "$source_directive"
+                    } >> "$target_file"
                     log_info "Added import directive to: $rel_path"
                 fi
             fi
@@ -172,7 +180,8 @@ cmd_sync() {
     log_info "Syncing Omarchy defaults from latest release..."
     init_dirs
     
-    local latest_version=$(get_latest_release "$OMARCHY_REPO")
+    local latest_version
+    latest_version=$(get_latest_release "$OMARCHY_REPO")
     
     if [ -z "$latest_version" ]; then
         log_error "Failed to fetch latest Omarchy release"
@@ -243,12 +252,21 @@ cmd_status() {
     echo ""
     log_info "Backups:"
     if [ -d "$BACKUP_DIR" ]; then
-        local backup_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | grep -v "^latest$" | wc -l)
+        local backup_count=0
+        local backup_name
+        for backup in "$BACKUP_DIR"/*; do
+            [ -e "$backup" ] || continue
+            backup_name=$(basename "$backup")
+            if [ "$backup_name" != "latest" ]; then
+                backup_count=$((backup_count + 1))
+            fi
+        done
         echo "  Count: $backup_count"
         echo "  Location: $BACKUP_DIR"
         
         if [ -L "${BACKUP_DIR}/latest" ]; then
-            local latest=$(readlink "${BACKUP_DIR}/latest")
+            local latest
+            latest=$(readlink "${BACKUP_DIR}/latest")
             echo "  Latest: $(basename "$latest")"
         fi
     else
@@ -260,7 +278,8 @@ cmd_status() {
     log_info "Version Tracking:"
     local current_version_file="${STOMARCHY_DIR}/omarchy_version"
     if [ -f "$current_version_file" ]; then
-        local current_version=$(cat "$current_version_file")
+        local current_version
+        current_version=$(cat "$current_version_file")
         echo "  Tracked version: $current_version"
     else
         echo "  No version tracked yet"
@@ -270,7 +289,8 @@ cmd_status() {
     echo ""
     log_info "Custom Configurations:"
     if [ -d "${STOMARCHY_DIR}/custom" ]; then
-        local custom_count=$(find "${STOMARCHY_DIR}/custom" -type f 2>/dev/null | wc -l)
+        local custom_count
+        custom_count=$(find "${STOMARCHY_DIR}/custom" -type f 2>/dev/null | wc -l)
         echo "  Count: $custom_count"
         echo "  Location: ${STOMARCHY_DIR}/custom"
     else

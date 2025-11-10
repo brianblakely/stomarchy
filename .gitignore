@@ -1,0 +1,24 @@
+# Build artifacts
+*.pkg.tar.zst
+pkg/
+src/
+
+# Test directories
+test/
+test_*/
+
+# Cache and temporary files
+*.cache
+*.tmp
+.stomarchy-test/
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
