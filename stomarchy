@@ -1,0 +1,356 @@
+#!/bin/bash
+#
+# stomarchy - Save and restore your Omarchy config without disrupting its opinionated design
+#
+# Usage: stomarchy [command] [options]
+#
+# Commands:
+#   backup    - Backup your Omarchy config customizations
+#   restore   - Restore your customizations by appending to Omarchy configs
+#   sync      - Sync Omarchy defaults from latest release
+#   status    - Show current status of configs
+#   help      - Show this help message
+#
+
+set -e
+
+VERSION="0.1.0"
+STOMARCHY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/stomarchy"
+BACKUP_DIR="${STOMARCHY_DIR}/backups"
+OMARCHY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+OMARCHY_REPO="basecamp/omarchy"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/stomarchy"
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+# Initialize directories
+init_dirs() {
+    mkdir -p "$STOMARCHY_DIR"
+    mkdir -p "$BACKUP_DIR"
+    mkdir -p "$CACHE_DIR"
+}
+
+# Get latest Omarchy release version
+get_latest_release() {
+    local repo="$1"
+    local release_url="https://api.github.com/repos/${repo}/releases/latest"
+    
+    if command -v curl &> /dev/null; then
+        curl -s "$release_url" | grep -oP '"tag_name": "\K(.*)(?=")'
+    elif command -v wget &> /dev/null; then
+        wget -qO- "$release_url" | grep -oP '"tag_name": "\K(.*)(?=")'
+    else
+        log_error "Neither curl nor wget found. Please install one of them."
+        exit 1
+    fi
+}
+
+# Backup user customizations
+cmd_backup() {
+    log_info "Backing up Omarchy customizations..."
+    init_dirs
+    
+    if [ ! -d "$OMARCHY_DIR" ]; then
+        log_error "Omarchy directory not found at: $OMARCHY_DIR"
+        log_info "Please install Omarchy first."
+        exit 1
+    fi
+    
+    # Create timestamped backup
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local backup_path="${BACKUP_DIR}/${timestamp}"
+    mkdir -p "$backup_path"
+    
+    # Copy all config files
+    cp -r "$OMARCHY_DIR"/* "$backup_path/" 2>/dev/null || true
+    
+    # Save metadata
+    echo "timestamp=${timestamp}" > "${backup_path}/.stomarchy-meta"
+    echo "omarchy_dir=${OMARCHY_DIR}" >> "${backup_path}/.stomarchy-meta"
+    
+    # Create a symlink to latest backup
+    ln -sf "$backup_path" "${BACKUP_DIR}/latest"
+    
+    log_success "Backup created at: $backup_path"
+    log_info "Latest backup symlinked at: ${BACKUP_DIR}/latest"
+}
+
+# Restore customizations by appending to configs
+cmd_restore() {
+    local backup_name="${1:-latest}"
+    log_info "Restoring customizations from backup: $backup_name"
+    init_dirs
+    
+    local backup_path="${BACKUP_DIR}/${backup_name}"
+    
+    # Resolve symlink if backup_path is a symlink
+    if [ -L "$backup_path" ]; then
+        backup_path=$(readlink -f "$backup_path")
+    fi
+    
+    if [ ! -d "$backup_path" ]; then
+        log_error "Backup not found: $backup_path"
+        log_info "Available backups:"
+        ls -1 "$BACKUP_DIR" 2>/dev/null | grep -v "^latest$" || echo "  (none)"
+        exit 1
+    fi
+    
+    if [ ! -d "$OMARCHY_DIR" ]; then
+        log_error "Omarchy directory not found at: $OMARCHY_DIR"
+        log_info "Please install Omarchy first."
+        exit 1
+    fi
+    
+    # Process each config file
+    while IFS= read -r -d '' backup_file; do
+        rel_path="${backup_file#$backup_path/}"
+        target_file="${OMARCHY_DIR}/${rel_path}"
+        custom_file="${STOMARCHY_DIR}/custom/${rel_path}"
+        
+        # Create custom config directory
+        mkdir -p "$(dirname "$custom_file")"
+        
+        # Copy user customizations to stomarchy custom dir
+        if [ -f "$backup_file" ]; then
+            cp "$backup_file" "$custom_file"
+            
+            # Append source directive to Omarchy config if not already present
+            if [ -f "$target_file" ]; then
+                source_directive="source = ${custom_file}"
+                
+                # Check file extension to determine directive syntax
+                case "${rel_path##*.}" in
+                    conf)
+                        source_directive="source = ${custom_file}"
+                        ;;
+                    sh)
+                        source_directive="source \"${custom_file}\""
+                        ;;
+                    *)
+                        source_directive="source ${custom_file}"
+                        ;;
+                esac
+                
+                # Add directive if not already present
+                if ! grep -Fq "$custom_file" "$target_file" 2>/dev/null; then
+                    echo "" >> "$target_file"
+                    echo "# Stomarchy customizations" >> "$target_file"
+                    echo "$source_directive" >> "$target_file"
+                    log_info "Added import directive to: $rel_path"
+                fi
+            fi
+        fi
+    done < <(find "$backup_path" -type f -not -name ".stomarchy-meta" -print0)
+    
+    log_success "Customizations restored from: $backup_path"
+}
+
+# Sync Omarchy defaults from latest release
+cmd_sync() {
+    log_info "Syncing Omarchy defaults from latest release..."
+    init_dirs
+    
+    local latest_version=$(get_latest_release "$OMARCHY_REPO")
+    
+    if [ -z "$latest_version" ]; then
+        log_error "Failed to fetch latest Omarchy release"
+        exit 1
+    fi
+    
+    log_info "Latest Omarchy version: $latest_version"
+    
+    local current_version_file="${STOMARCHY_DIR}/omarchy_version"
+    local current_version=""
+    
+    if [ -f "$current_version_file" ]; then
+        current_version=$(cat "$current_version_file")
+        log_info "Current tracked version: $current_version"
+    fi
+    
+    if [ "$current_version" = "$latest_version" ]; then
+        log_success "Already at latest version: $latest_version"
+        return 0
+    fi
+    
+    # Download and compare configs
+    local temp_dir="${CACHE_DIR}/omarchy-${latest_version}"
+    
+    if [ ! -d "$temp_dir" ]; then
+        log_info "Downloading Omarchy $latest_version..."
+        mkdir -p "$temp_dir"
+        
+        local archive_url="https://github.com/${OMARCHY_REPO}/archive/refs/tags/${latest_version}.tar.gz"
+        
+        if command -v curl &> /dev/null; then
+            curl -sL "$archive_url" | tar xz -C "$temp_dir" --strip-components=1
+        elif command -v wget &> /dev/null; then
+            wget -qO- "$archive_url" | tar xz -C "$temp_dir" --strip-components=1
+        else
+            log_error "Neither curl nor wget found."
+            exit 1
+        fi
+    fi
+    
+    # Show differences
+    if [ -d "$OMARCHY_DIR" ]; then
+        log_info "Changes in default configs:"
+        diff -ru "$OMARCHY_DIR" "$temp_dir" 2>/dev/null | head -50 || true
+    else
+        log_warn "Omarchy not installed locally. Skipping diff."
+    fi
+    
+    # Update version tracking
+    echo "$latest_version" > "$current_version_file"
+    log_success "Updated version tracking to: $latest_version"
+    log_info "To apply updates, reinstall Omarchy and run 'stomarchy restore'"
+}
+
+# Show status
+cmd_status() {
+    log_info "Stomarchy Status"
+    echo ""
+    
+    # Check Omarchy installation
+    if [ -d "$OMARCHY_DIR" ]; then
+        log_success "Omarchy directory: $OMARCHY_DIR"
+    else
+        log_warn "Omarchy directory not found: $OMARCHY_DIR"
+    fi
+    
+    # Check backups
+    echo ""
+    log_info "Backups:"
+    if [ -d "$BACKUP_DIR" ]; then
+        local backup_count=$(ls -1 "$BACKUP_DIR" 2>/dev/null | grep -v "^latest$" | wc -l)
+        echo "  Count: $backup_count"
+        echo "  Location: $BACKUP_DIR"
+        
+        if [ -L "${BACKUP_DIR}/latest" ]; then
+            local latest=$(readlink "${BACKUP_DIR}/latest")
+            echo "  Latest: $(basename "$latest")"
+        fi
+    else
+        echo "  (none)"
+    fi
+    
+    # Check version tracking
+    echo ""
+    log_info "Version Tracking:"
+    local current_version_file="${STOMARCHY_DIR}/omarchy_version"
+    if [ -f "$current_version_file" ]; then
+        local current_version=$(cat "$current_version_file")
+        echo "  Tracked version: $current_version"
+    else
+        echo "  No version tracked yet"
+    fi
+    
+    # Check custom configs
+    echo ""
+    log_info "Custom Configurations:"
+    if [ -d "${STOMARCHY_DIR}/custom" ]; then
+        local custom_count=$(find "${STOMARCHY_DIR}/custom" -type f 2>/dev/null | wc -l)
+        echo "  Count: $custom_count"
+        echo "  Location: ${STOMARCHY_DIR}/custom"
+    else
+        echo "  (none)"
+    fi
+}
+
+# Show help
+cmd_help() {
+    cat << EOF
+stomarchy v${VERSION}
+Save and restore your Omarchy config without disrupting its opinionated design
+
+USAGE:
+    stomarchy [COMMAND] [OPTIONS]
+
+COMMANDS:
+    backup              Backup your current Omarchy customizations
+    restore [NAME]      Restore customizations from backup (default: latest)
+    sync                Sync with latest Omarchy release and show changes
+    status              Show current status and configuration
+    help                Show this help message
+
+EXAMPLES:
+    # Backup current configs
+    stomarchy backup
+
+    # Restore latest backup
+    stomarchy restore
+
+    # Restore specific backup
+    stomarchy restore 20250110_143022
+
+    # Check for Omarchy updates
+    stomarchy sync
+
+    # View status
+    stomarchy status
+
+DIRECTORIES:
+    Config:     ${STOMARCHY_DIR}
+    Backups:    ${BACKUP_DIR}
+    Cache:      ${CACHE_DIR}
+    Omarchy:    ${OMARCHY_DIR}
+
+For more information, visit: https://github.com/brianblakely/stomarchy
+EOF
+}
+
+# Main command dispatcher
+main() {
+    local command="${1:-help}"
+    
+    case "$command" in
+        backup)
+            cmd_backup
+            ;;
+        restore)
+            shift
+            cmd_restore "$@"
+            ;;
+        sync)
+            cmd_sync
+            ;;
+        status)
+            cmd_status
+            ;;
+        help|--help|-h)
+            cmd_help
+            ;;
+        --version|-v)
+            echo "stomarchy v${VERSION}"
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            echo ""
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
