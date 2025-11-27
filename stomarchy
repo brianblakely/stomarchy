@@ -5,10 +5,10 @@
 # Usage: stomarchy [command] [options]
 #
 # Commands:
-#   backup    - Backup your Omarchy config customizations
-#   restore   - Restore your customizations by appending to Omarchy configs
+#   add       - Track a file with stomarchy
+#   apply     - Apply tracked customizations to Omarchy configs
 #   sync      - Sync Omarchy defaults from latest release
-#   status    - Show current status of configs
+#   status    - Show current status of tracked files
 #   help      - Show this help message
 #
 
@@ -16,10 +16,9 @@ set -e
 
 VERSION="0.1.0"
 STOMARCHY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/stomarchy"
-BACKUP_DIR="${STOMARCHY_DIR}/backups"
-OMARCHY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
 OMARCHY_REPO="basecamp/omarchy"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/stomarchy"
+VERSION_FILE="${STOMARCHY_DIR}/.stomarchy-omarchy-version"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -48,7 +47,6 @@ log_error() {
 # Initialize directories
 init_dirs() {
     mkdir -p "$STOMARCHY_DIR"
-    mkdir -p "$BACKUP_DIR"
     mkdir -p "$CACHE_DIR"
 }
 
@@ -67,112 +65,119 @@ get_latest_release() {
     fi
 }
 
-# Backup user customizations
-cmd_backup() {
-    log_info "Backing up Omarchy customizations..."
-    init_dirs
+# Convert absolute path to stomarchy-relative path
+# Stomarchy root corresponds to $HOME
+get_stomarchy_path() {
+    local file_path="$1"
+    local abs_path
+    abs_path=$(realpath "$file_path" 2>/dev/null || echo "$file_path")
     
-    if [ ! -d "$OMARCHY_DIR" ]; then
-        log_error "Omarchy directory not found at: $OMARCHY_DIR"
-        log_info "Please install Omarchy first."
+    # Strip $HOME prefix to get relative path
+    local rel_path="${abs_path#"$HOME"/}"
+    
+    if [ "$rel_path" = "$abs_path" ]; then
+        log_error "File must be under home directory: $HOME"
         exit 1
     fi
     
-    # Create timestamped backup
-    local timestamp
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    local backup_path="${BACKUP_DIR}/${timestamp}"
-    mkdir -p "$backup_path"
-    
-    # Copy all config files
-    cp -r "$OMARCHY_DIR"/* "$backup_path/" 2>/dev/null || true
-    
-    # Save metadata
-    echo "timestamp=${timestamp}" > "${backup_path}/.stomarchy-meta"
-    echo "omarchy_dir=${OMARCHY_DIR}" >> "${backup_path}/.stomarchy-meta"
-    
-    # Create a symlink to latest backup
-    ln -sf "$backup_path" "${BACKUP_DIR}/latest"
-    
-    log_success "Backup created at: $backup_path"
-    log_info "Latest backup symlinked at: ${BACKUP_DIR}/latest"
+    echo "${STOMARCHY_DIR}/${rel_path}"
 }
 
-# Restore customizations by appending to configs
-cmd_restore() {
-    local backup_name="${1:-latest}"
-    log_info "Restoring customizations from backup: $backup_name"
+# Add a file to stomarchy tracking
+cmd_add() {
+    if [ -z "$1" ]; then
+        log_error "Usage: stomarchy add <file>"
+        exit 1
+    fi
+    
+    local source_file="$1"
+    
+    if [ ! -f "$source_file" ]; then
+        log_error "File not found: $source_file"
+        exit 1
+    fi
+    
     init_dirs
     
-    local backup_path="${BACKUP_DIR}/${backup_name}"
+    local stomarchy_path
+    stomarchy_path=$(get_stomarchy_path "$source_file")
     
-    # Resolve symlink if backup_path is a symlink
-    if [ -L "$backup_path" ]; then
-        backup_path=$(readlink -f "$backup_path")
-    fi
+    # Create directory structure
+    mkdir -p "$(dirname "$stomarchy_path")"
     
-    if [ ! -d "$backup_path" ]; then
-        log_error "Backup not found: $backup_path"
-        log_info "Available backups:"
-        # List backups excluding 'latest'
-        for backup in "$BACKUP_DIR"/*; do
-            [ -e "$backup" ] || continue
-            backup_name=$(basename "$backup")
-            [ "$backup_name" != "latest" ] && echo "  $backup_name"
-        done
+    # Copy file to stomarchy directory
+    cp "$source_file" "$stomarchy_path"
+    
+    log_success "Added: $source_file"
+    log_info "Tracked at: $stomarchy_path"
+    log_info "Use 'stomarchy apply' to add source directives to Omarchy configs"
+}
+
+# Apply tracked customizations by appending source directives
+cmd_apply() {
+    log_info "Applying tracked customizations..."
+    init_dirs
+    
+    if [ ! -d "$STOMARCHY_DIR" ]; then
+        log_error "No tracked files found. Use 'stomarchy add <file>' first."
         exit 1
     fi
     
-    if [ ! -d "$OMARCHY_DIR" ]; then
-        log_error "Omarchy directory not found at: $OMARCHY_DIR"
-        log_info "Please install Omarchy first."
-        exit 1
-    fi
+    local files_processed=0
     
-    # Process each config file
-    while IFS= read -r -d '' backup_file; do
-        rel_path="${backup_file#"$backup_path"/}"
-        target_file="${OMARCHY_DIR}/${rel_path}"
-        custom_file="${STOMARCHY_DIR}/custom/${rel_path}"
+    # Process each tracked file (skip dotfiles that are stomarchy internals)
+    while IFS= read -r -d '' tracked_file; do
+        # Get relative path from stomarchy dir
+        local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
         
-        # Create custom config directory
-        mkdir -p "$(dirname "$custom_file")"
-        
-        # Copy user customizations to stomarchy custom dir
-        if [ -f "$backup_file" ]; then
-            cp "$backup_file" "$custom_file"
-            
-            # Append source directive to Omarchy config if not already present
-            if [ -f "$target_file" ]; then
-                source_directive="source = ${custom_file}"
-                
-                # Check file extension to determine directive syntax
-                case "${rel_path##*.}" in
-                    conf)
-                        source_directive="source = ${custom_file}"
-                        ;;
-                    sh)
-                        source_directive="source \"${custom_file}\""
-                        ;;
-                    *)
-                        source_directive="source ${custom_file}"
-                        ;;
-                esac
-                
-                # Add directive if not already present
-                if ! grep -Fq "$custom_file" "$target_file" 2>/dev/null; then
-                    {
-                        echo ""
-                        echo "# Stomarchy customizations"
-                        echo "$source_directive"
-                    } >> "$target_file"
-                    log_info "Added import directive to: $rel_path"
-                fi
-            fi
+        # Skip stomarchy internal files (dotfiles starting with .stomarchy-)
+        local filename
+        filename=$(basename "$tracked_file")
+        if [[ "$filename" == .stomarchy-* ]]; then
+            continue
         fi
-    done < <(find "$backup_path" -type f -not -name ".stomarchy-meta" -print0)
+        
+        # The corresponding file in home directory
+        local target_file="${HOME}/${rel_path}"
+        
+        if [ ! -f "$target_file" ]; then
+            log_warn "Target file not found, skipping: $target_file"
+            continue
+        fi
+        
+        # Determine source directive syntax based on file extension
+        local source_directive
+        case "${rel_path##*.}" in
+            conf)
+                source_directive="source = ${tracked_file}"
+                ;;
+            sh)
+                source_directive="source \"${tracked_file}\""
+                ;;
+            *)
+                source_directive="source ${tracked_file}"
+                ;;
+        esac
+        
+        # Add directive if not already present
+        if ! grep -Fq "$tracked_file" "$target_file" 2>/dev/null; then
+            {
+                echo ""
+                echo "# Stomarchy customizations"
+                echo "$source_directive"
+            } >> "$target_file"
+            log_info "Added import directive to: $target_file"
+            files_processed=$((files_processed + 1))
+        else
+            log_info "Already applied: $target_file"
+        fi
+    done < <(find "$STOMARCHY_DIR" -type f -print0)
     
-    log_success "Customizations restored from: $backup_path"
+    if [ "$files_processed" -eq 0 ]; then
+        log_info "No new customizations to apply"
+    else
+        log_success "Applied $files_processed customization(s)"
+    fi
 }
 
 # Sync Omarchy defaults from latest release
@@ -190,11 +195,10 @@ cmd_sync() {
     
     log_info "Latest Omarchy version: $latest_version"
     
-    local current_version_file="${STOMARCHY_DIR}/omarchy_version"
     local current_version=""
     
-    if [ -f "$current_version_file" ]; then
-        current_version=$(cat "$current_version_file")
+    if [ -f "$VERSION_FILE" ]; then
+        current_version=$(cat "$VERSION_FILE")
         log_info "Current tracked version: $current_version"
     fi
     
@@ -222,18 +226,42 @@ cmd_sync() {
         fi
     fi
     
-    # Show differences
-    if [ -d "$OMARCHY_DIR" ]; then
-        log_info "Changes in default configs:"
-        diff -ru "$OMARCHY_DIR" "$temp_dir" 2>/dev/null | head -50 || true
-    else
-        log_warn "Omarchy not installed locally. Skipping diff."
+    # Show differences against tracked files
+    log_info "Changes in default configs:"
+    
+    local has_changes=false
+    while IFS= read -r -d '' tracked_file; do
+        local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
+        
+        # Skip stomarchy internal files
+        local filename
+        filename=$(basename "$tracked_file")
+        if [[ "$filename" == .stomarchy-* ]]; then
+            continue
+        fi
+        
+        # Look for corresponding file in downloaded release
+        local release_file="${temp_dir}/${rel_path}"
+        if [ -f "$release_file" ]; then
+            local diff_output
+            diff_output=$(diff -u "$tracked_file" "$release_file" 2>/dev/null) || true
+            if [ -n "$diff_output" ]; then
+                echo "=== $rel_path ==="
+                echo "$diff_output" | head -30
+                echo ""
+                has_changes=true
+            fi
+        fi
+    done < <(find "$STOMARCHY_DIR" -type f -print0)
+    
+    if [ "$has_changes" = false ]; then
+        log_info "No changes detected in tracked files"
     fi
     
     # Update version tracking
-    echo "$latest_version" > "$current_version_file"
+    echo "$latest_version" > "$VERSION_FILE"
     log_success "Updated version tracking to: $latest_version"
-    log_info "To apply updates, reinstall Omarchy and run 'stomarchy restore'"
+    log_info "To apply updates, reinstall Omarchy and run 'stomarchy apply'"
 }
 
 # Show status
@@ -241,58 +269,48 @@ cmd_status() {
     log_info "Stomarchy Status"
     echo ""
     
-    # Check Omarchy installation
-    if [ -d "$OMARCHY_DIR" ]; then
-        log_success "Omarchy directory: $OMARCHY_DIR"
+    # Check stomarchy directory
+    if [ -d "$STOMARCHY_DIR" ]; then
+        log_success "Stomarchy directory: $STOMARCHY_DIR"
     else
-        log_warn "Omarchy directory not found: $OMARCHY_DIR"
-    fi
-    
-    # Check backups
-    echo ""
-    log_info "Backups:"
-    if [ -d "$BACKUP_DIR" ]; then
-        local backup_count=0
-        local backup_name
-        for backup in "$BACKUP_DIR"/*; do
-            [ -e "$backup" ] || continue
-            backup_name=$(basename "$backup")
-            if [ "$backup_name" != "latest" ]; then
-                backup_count=$((backup_count + 1))
-            fi
-        done
-        echo "  Count: $backup_count"
-        echo "  Location: $BACKUP_DIR"
-        
-        if [ -L "${BACKUP_DIR}/latest" ]; then
-            local latest
-            latest=$(readlink "${BACKUP_DIR}/latest")
-            echo "  Latest: $(basename "$latest")"
-        fi
-    else
-        echo "  (none)"
+        log_warn "Stomarchy directory not found: $STOMARCHY_DIR"
     fi
     
     # Check version tracking
     echo ""
     log_info "Version Tracking:"
-    local current_version_file="${STOMARCHY_DIR}/omarchy_version"
-    if [ -f "$current_version_file" ]; then
+    if [ -f "$VERSION_FILE" ]; then
         local current_version
-        current_version=$(cat "$current_version_file")
+        current_version=$(cat "$VERSION_FILE")
         echo "  Tracked version: $current_version"
     else
         echo "  No version tracked yet"
     fi
     
-    # Check custom configs
+    # List tracked files
     echo ""
-    log_info "Custom Configurations:"
-    if [ -d "${STOMARCHY_DIR}/custom" ]; then
-        local custom_count
-        custom_count=$(find "${STOMARCHY_DIR}/custom" -type f 2>/dev/null | wc -l)
-        echo "  Count: $custom_count"
-        echo "  Location: ${STOMARCHY_DIR}/custom"
+    log_info "Tracked Files:"
+    if [ -d "$STOMARCHY_DIR" ]; then
+        local file_count=0
+        while IFS= read -r -d '' tracked_file; do
+            local filename
+            filename=$(basename "$tracked_file")
+            # Skip stomarchy internal files
+            if [[ "$filename" == .stomarchy-* ]]; then
+                continue
+            fi
+            
+            local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
+            echo "  ~/${rel_path}"
+            file_count=$((file_count + 1))
+        done < <(find "$STOMARCHY_DIR" -type f -print0)
+        
+        if [ "$file_count" -eq 0 ]; then
+            echo "  (none)"
+        else
+            echo ""
+            echo "  Total: $file_count file(s)"
+        fi
     else
         echo "  (none)"
     fi
@@ -308,21 +326,18 @@ USAGE:
     stomarchy [COMMAND] [OPTIONS]
 
 COMMANDS:
-    backup              Backup your current Omarchy customizations
-    restore [NAME]      Restore customizations from backup (default: latest)
+    add <file>          Track a file with stomarchy
+    apply               Apply tracked customizations to Omarchy configs
     sync                Sync with latest Omarchy release and show changes
-    status              Show current status and configuration
+    status              Show current status and tracked files
     help                Show this help message
 
 EXAMPLES:
-    # Backup current configs
-    stomarchy backup
+    # Track a config file
+    stomarchy add ~/.config/hypr/hyprland.conf
 
-    # Restore latest backup
-    stomarchy restore
-
-    # Restore specific backup
-    stomarchy restore 20250110_143022
+    # Apply source directives to Omarchy configs
+    stomarchy apply
 
     # Check for Omarchy updates
     stomarchy sync
@@ -330,11 +345,21 @@ EXAMPLES:
     # View status
     stomarchy status
 
+DIRECTORY STRUCTURE:
+    Files are tracked under ~/.config/stomarchy/ with the same
+    directory structure as your home directory:
+    
+    ~/                              ~/.config/stomarchy/
+    ├── .config/                    ├── .config/
+    │   └── hypr/                   │   └── hypr/
+    │       └── hyprland.conf       │       └── hyprland.conf
+    └── .bashrc                     └── .bashrc
+
+    Use git to version control your ~/.config/stomarchy/ directory.
+
 DIRECTORIES:
     Config:     ${STOMARCHY_DIR}
-    Backups:    ${BACKUP_DIR}
     Cache:      ${CACHE_DIR}
-    Omarchy:    ${OMARCHY_DIR}
 
 For more information, visit: https://github.com/brianblakely/stomarchy
 EOF
@@ -345,12 +370,12 @@ main() {
     local command="${1:-help}"
     
     case "$command" in
-        backup)
-            cmd_backup
-            ;;
-        restore)
+        add)
             shift
-            cmd_restore "$@"
+            cmd_add "$@"
+            ;;
+        apply)
+            cmd_apply
             ;;
         sync)
             cmd_sync

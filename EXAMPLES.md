@@ -10,12 +10,19 @@ After installing both Omarchy and Stomarchy:
 
 ```bash
 # 1. Make your customizations to Omarchy configs
-# For example, edit ~/.config/omarchy/hypr/hyprland.conf
+# For example, edit ~/.config/hypr/hyprland.conf
 
-# 2. Backup your customizations
-stomarchy backup
+# 2. Track your customizations with stomarchy
+stomarchy add ~/.config/hypr/hyprland.conf
 
-# This creates a timestamped backup and tracks it as "latest"
+# 3. Apply source directives to Omarchy configs
+stomarchy apply
+
+# 4. (Recommended) Version control your stomarchy directory
+cd ~/.config/stomarchy
+git init
+git add .
+git commit -m "Initial customizations"
 ```
 
 ### After Omarchy Update
@@ -26,22 +33,22 @@ When Omarchy releases a new version:
 # 1. Check what changed in the new version
 stomarchy sync
 
-# This will show you the diff between your current configs and the new defaults
+# This will show you the diff between your tracked files and the new defaults
 
 # 2. Update Omarchy via your package manager
 sudo pacman -S omarchy  # or yay -S omarchy-git
 
-# 3. Restore your customizations
-stomarchy restore
+# 3. Reapply your customizations
+stomarchy apply
 
-# This will append your custom configs via source directives
+# This will add source directives to the new Omarchy configs
 ```
 
 ## Practical Examples
 
 ### Example 1: Customizing Hyprland Keybindings
 
-Original Omarchy config (`~/.config/omarchy/hypr/hyprland.conf`):
+Original Omarchy config (`~/.config/hypr/hyprland.conf`):
 ```conf
 bind = SUPER, Q, killactive
 bind = SUPER, F, fullscreen
@@ -51,73 +58,61 @@ bind = SUPER, Return, exec, kitty
 Your workflow:
 ```bash
 # 1. Edit the config to add your keybindings
-nano ~/.config/omarchy/hypr/hyprland.conf
+nano ~/.config/hypr/hyprland.conf
 
 # Add your custom bindings:
 bind = SUPER, B, exec, firefox
 bind = SUPER SHIFT, S, exec, grim
 
-# 2. Backup your changes
-stomarchy backup
+# 2. Track your changes with stomarchy
+stomarchy add ~/.config/hypr/hyprland.conf
+
+# 3. Apply to add source directive
+stomarchy apply
 ```
 
-After `stomarchy restore`, your config becomes:
+After `stomarchy apply`, your Omarchy config becomes:
 ```conf
 bind = SUPER, Q, killactive
 bind = SUPER, F, fullscreen
 bind = SUPER, Return, exec, kitty
 
 # Stomarchy customizations
-source = ~/.config/stomarchy/custom/hypr/hyprland.conf
+source = ~/.config/stomarchy/.config/hypr/hyprland.conf
 ```
 
-And `~/.config/stomarchy/custom/hypr/hyprland.conf` contains:
-```conf
-bind = SUPER, Q, killactive
-bind = SUPER, F, fullscreen
-bind = SUPER, Return, exec, kitty
-bind = SUPER, B, exec, firefox
-bind = SUPER SHIFT, S, exec, grim
-```
-
-### Example 2: Managing Multiple Backups
+### Example 2: Tracking Multiple Files
 
 ```bash
-# Before making experimental changes
-stomarchy backup
-# Creates: ~/.config/stomarchy/backups/20250110_140000
+# Track several config files
+stomarchy add ~/.config/hypr/hyprland.conf
+stomarchy add ~/.config/waybar/config
+stomarchy add ~/.config/kitty/kitty.conf
+stomarchy add ~/.bashrc
 
-# Make some changes...
-# Try them out...
-
-# Make another backup after tweaking
-stomarchy backup
-# Creates: ~/.config/stomarchy/backups/20250110_150000
-
-# List your backups
-ls ~/.config/stomarchy/backups/
-# Output:
-# 20250110_140000/
-# 20250110_150000/
-# latest -> 20250110_150000
-
-# Restore from a specific backup
-stomarchy restore 20250110_140000
-
-# Or restore the latest
-stomarchy restore
-```
-
-### Example 3: Checking Status
-
-```bash
+# Check what's being tracked
 stomarchy status
 
-# Output shows:
-# - Omarchy installation location
-# - Number and location of backups
-# - Currently tracked Omarchy version
-# - Number of custom configurations
+# Apply all source directives at once
+stomarchy apply
+```
+
+### Example 3: Using Git for Version Control
+
+```bash
+# Initialize git in your stomarchy directory
+cd ~/.config/stomarchy
+git init
+
+# Add all tracked files
+git add .
+
+# Commit your changes
+git commit -m "Add my Omarchy customizations"
+
+# Push to a remote (backup your configs!)
+git remote add origin git@github.com:username/my-omarchy-config.git
+git push -u origin main
 ```
 
 ### Example 4: Fresh Install Workflow
@@ -131,72 +126,79 @@ sudo pacman -S omarchy
 # 2. Install Stomarchy
 sudo pacman -S stomarchy
 
-# 3. (Optional) Copy your backup from another machine
-# rsync -av old-machine:~/.config/stomarchy/backups/ ~/.config/stomarchy/backups/
+# 3. Clone your stomarchy config from git
+git clone git@github.com:username/my-omarchy-config.git ~/.config/stomarchy
 
-# 4. Restore your customizations
-stomarchy restore
+# 4. Apply your customizations
+stomarchy apply
 
 # Your custom configs are now integrated!
 ```
 
-## Advanced Usage
-
-### Selective Restoration
-
-If you want to restore only specific configs:
+### Example 5: Checking Status
 
 ```bash
-# 1. List files in a backup
-find ~/.config/stomarchy/backups/latest -type f
+stomarchy status
 
-# 2. Manually copy specific files
-cp ~/.config/stomarchy/backups/latest/hypr/hyprland.conf \
-   ~/.config/stomarchy/custom/hypr/hyprland.conf
-
-# 3. Manually add source directive to Omarchy config
-echo "" >> ~/.config/omarchy/hypr/hyprland.conf
-echo "# Stomarchy customizations" >> ~/.config/omarchy/hypr/hyprland.conf
-echo "source = ~/.config/stomarchy/custom/hypr/hyprland.conf" >> ~/.config/omarchy/hypr/hyprland.conf
+# Output shows:
+# - Stomarchy directory location
+# - Currently tracked Omarchy version
+# - List of all tracked files
 ```
 
-### Version Tracking
+## Advanced Usage
 
-Stomarchy tracks which Omarchy version it last synced with:
+### Syncing with Omarchy Updates
 
 ```bash
-# Check tracked version
-cat ~/.config/stomarchy/omarchy_version
-
-# When you run sync, it compares this with the latest release
+# Check for Omarchy updates
 stomarchy sync
 
-# This helps you see what changed between versions
+# This will:
+# - Fetch the latest Omarchy release
+# - Compare with your tracked files
+# - Show differences
+# - Update the tracked version in .stomarchy-omarchy-version
+```
+
+### Directory Structure
+
+After tracking some files:
+
+```
+~/.config/stomarchy/
+├── .config/
+│   ├── hypr/
+│   │   └── hyprland.conf
+│   ├── waybar/
+│   │   └── config
+│   └── kitty/
+│       └── kitty.conf
+├── .bashrc
+└── .stomarchy-omarchy-version    # Internal: tracked Omarchy version
+
+~/.cache/stomarchy/               # Downloaded Omarchy releases for diffing
 ```
 
 ## Tips and Best Practices
 
-1. **Backup Often**: Run `stomarchy backup` before making significant changes
+1. **Use Git**: Version control your `~/.config/stomarchy/` directory with git
 2. **Use Sync**: Run `stomarchy sync` periodically to stay aware of Omarchy updates
-3. **Keep Backups Clean**: Old backups can be safely deleted from `~/.config/stomarchy/backups/`
-4. **Check Status**: Use `stomarchy status` to verify your setup
-5. **Test Restores**: After restore, verify your configs work as expected
+3. **Track Selectively**: Only track files you've actually customized
+4. **Check Status**: Use `stomarchy status` to see what's being tracked
+5. **After Omarchy Update**: Always run `stomarchy apply` after updating Omarchy
 
 ## Troubleshooting
 
-### "Omarchy directory not found"
-- Ensure Omarchy is installed: `pacman -Q omarchy`
-- Check the default location: `ls ~/.config/omarchy`
-
-### "Backup not found"
-- List available backups: `ls ~/.config/stomarchy/backups/`
-- Use specific backup name: `stomarchy restore 20250110_140000`
+### "File not found"
+- Ensure the file exists: `ls -la <filepath>`
+- Use absolute paths or paths relative to current directory
 
 ### Custom configs not working
-- Verify source directive was added: `grep -r "stomarchy" ~/.config/omarchy/`
-- Check custom file exists: `ls ~/.config/stomarchy/custom/`
+- Verify source directive was added: `grep -r "stomarchy" ~/.config/`
+- Check tracked file exists: `stomarchy status`
 - Ensure the application supports `source` directives
 
-### Restore not idempotent
+### Apply not idempotent
 - Stomarchy checks if source directives already exist before adding them
-- Running restore multiple times is safe and won't duplicate directives
+- Running apply multiple times is safe and won't duplicate directives
