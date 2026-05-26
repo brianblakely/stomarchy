@@ -6,12 +6,7 @@ pkgdesc="Save and restore your Omarchy config without disrupting its opinionated
 arch=('any')
 url="https://github.com/brianblakely/stomarchy"
 license=('MIT')
-depends=('bash' 'coreutils' 'grep' 'tar')
-optdepends=(
-    'curl: for downloading Omarchy releases'
-    'wget: alternative to curl for downloading releases'
-    'diffutils: for showing config differences'
-)
+depends=('bash' 'coreutils' 'diffutils' 'findutils' 'gawk' 'grep' 'sed')
 source=("stomarchy")
 sha256sums=('SKIP')
 

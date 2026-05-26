@@ -2,12 +2,13 @@
 
 Save and restore your Omarchy config without disrupting its opinionated design.
 
-Stomarchy is a shell-script-based application similar to GNU Stow, designed specifically for managing [Omarchy](https://github.com/basecamp/omarchy) configuration files on Arch Linux. Unlike Stow which uses symlinks, Stomarchy appends your customizations to the default configs via import directives (like `source` in Hyprland configs), allowing you to maintain your tweaks while keeping Omarchy's opinionated design intact.
+Stomarchy is a shell-script-based application similar to GNU Stow, designed specifically for managing [Omarchy](https://omarchy.org/) configuration files. Unlike Stow which uses symlinks, Stomarchy stores diff-only runtime snippets and imports them from restored Omarchy defaults, allowing you to maintain your tweaks while keeping Omarchy's opinionated design intact.
 
 ## Features
 
-- 📦 **Import-based**: Uses `source` directives instead of symlinks for cleaner integration
-- 🔍 **Sync Tracking**: Monitor and sync with latest Omarchy releases
+- 📦 **Import-based**: Uses source/import directives instead of symlinks for cleaner integration
+- ✂️ **Diff-only**: Tracks only runtime-representable changes from edited configs
+- 🔍 **Local Sync**: Refresh `~/.config` from Omarchy's current local defaults
 - 🎯 **Non-disruptive**: Preserves Omarchy's default configs while adding your tweaks
 - 🏗️ **Arch-ready**: Includes PKGBUILD for easy Arch Linux packaging
 - 🔄 **Git-friendly**: Track your `~/.config/stomarchy/` directory with git
@@ -38,15 +39,6 @@ sudo cp stomarchy /usr/bin/stomarchy
 sudo chmod +x /usr/bin/stomarchy
 ```
 
-## Requirements
-
-- **bash** - Shell interpreter
-- **coreutils** - Basic file utilities
-- **grep** - Text pattern matching
-- **tar** - Archive extraction
-- **curl** or **wget** - For downloading Omarchy releases (optional)
-- **diffutils** - For showing config differences (optional)
-
 ## Usage
 
 ### Basic Commands
@@ -55,13 +47,16 @@ sudo chmod +x /usr/bin/stomarchy
 # Show help and available commands
 stomarchy help
 
-# Track a config file
+# Track diff-only changes and update the config file
 stomarchy add ~/.config/hypr/hyprland.conf
 
-# Apply source directives to Omarchy configs
-stomarchy apply
+# Link checked-out tracked snippets into ~/.config
+stomarchy link
 
-# Check for Omarchy updates and see changes
+# Stop tracking a file and restore the Omarchy default
+stomarchy remove ~/.config/hypr/hyprland.conf
+
+# Copy current Omarchy defaults into ~/.config
 stomarchy sync
 
 # View current status
@@ -70,24 +65,20 @@ stomarchy status
 
 ### Typical Workflow
 
-1. **Track your customizations**: After making your customizations:
+1. **Track and wire your customizations**: After making your customizations:
+
    ```bash
    stomarchy add ~/.config/hypr/hyprland.conf
    ```
 
-2. **Apply to Omarchy**: Add source directives to Omarchy configs:
-   ```bash
-   stomarchy apply
-   ```
+2. **After Omarchy Update**: When Omarchy ships changed defaults:
 
-3. **After Omarchy Update**: When Omarchy releases a new version:
    ```bash
-   stomarchy sync        # Check what changed
    # Update Omarchy through your package manager
-   stomarchy apply       # Reapply your customizations
+   stomarchy sync        # Copy current local defaults and reattach tracked imports
    ```
 
-4. **Version control**: Use git to manage your customizations:
+3. **Version control**: Use git to manage your customizations:
    ```bash
    cd ~/.config/stomarchy
    git init
@@ -99,41 +90,67 @@ stomarchy status
 
 Unlike GNU Stow which creates symlinks, Stomarchy:
 
-1. **Add**: Copies your config files to `~/.config/stomarchy/` preserving full directory structure
-2. **Apply**: 
-   - Appends `source` directives to Omarchy's default config files
-   - This allows Omarchy updates to modify defaults while preserving your tweaks
-3. **Sync**: 
-   - Fetches latest Omarchy release information
-   - Compares with your tracked files
-   - Shows you what changed in the defaults
+1. **Add**:
+   - Looks up the untouched original in `~/.local/share/omarchy/config/`
+   - Compares it with your edited `~/.config/` file
+   - Stores only runtime-representable changes under `~/.config/stomarchy/.config/`
+   - Backs up the current target config
+   - Restores the target from the Omarchy original
+   - Appends a marked import block pointing at the tracked snippet
+2. **Sync**:
+   - Copies every file from `~/.local/share/omarchy/config/` into `~/.config/`
+   - Backs up changed target files before replacing them
+   - Reattaches import blocks for tracked Stomarchy snippets
+3. **Link**:
+   - Scans checked-out snippets in `~/.config/stomarchy/.config/`
+   - Restores each matching target from the Omarchy original
+   - Appends the correct import block without recalculating snippets
+   - Accepts either a target config path or a tracked snippet path for one-file linking
+4. **Remove**:
+   - Deletes the tracked snippet for a specific file
+   - Backs up the current target config
+   - Restores the target from the Omarchy original without an import block
 
 ### Example: Hyprland Config
 
-After running `stomarchy add` and `stomarchy apply`, your Hyprland config might look like:
+After running `stomarchy add`, your Hyprland config might look like:
 
 ```conf
 # Original Omarchy defaults
 bind = SUPER, Q, killactive
 bind = SUPER, F, fullscreen
 
-# Stomarchy customizations
+# BEGIN Stomarchy customizations
 source = /home/user/.config/stomarchy/.config/hypr/hyprland.conf
+# END Stomarchy customizations
 ```
 
-Your custom file is tracked in stomarchy with the full directory structure from home.
+The tracked Stomarchy file contains only the added/replacement runtime lines, not a full copy of `hyprland.conf`.
+
+### Example: Hyprland Lua Config
+
+Hyprland Lua configs use `dofile()` so snippets can stay in the same tracked location:
+
+```lua
+hl.set("general:gaps_in", 5)
+
+-- BEGIN Stomarchy customizations
+dofile("/home/user/.config/stomarchy/.config/hypr/hyprland.lua")
+-- END Stomarchy customizations
+```
+
+Lua support is scoped to Hyprland configs under `~/.config/hypr/*.lua`. Stomarchy tracks top-level additive statements and normalizes replaced `hl.bind("KEYS", ...)` calls by emitting `hl.unbind("KEYS")` before the replacement.
 
 ## Directory Structure
 
-Stomarchy mirrors your home directory structure under `~/.config/stomarchy/`:
+Stomarchy mirrors your `~/.config/` structure under `~/.config/stomarchy/.config/`:
 
 ```
-~/                              ~/.config/stomarchy/
-├── .config/                    ├── .config/
-│   └── hypr/                   │   └── hypr/
-│       └── hyprland.conf       │       └── hyprland.conf
-└── .bashrc                     ├── .bashrc
-                                └── .stomarchy-omarchy-version
+~/.config/                      ~/.config/stomarchy/
+├── hypr/                       ├── .config/
+│   ├── hyprland.conf           │   └── hypr/
+│   └── hyprland.lua            │       ├── hyprland.conf
+                                │       └── hyprland.lua
 ```
 
 Internal stomarchy files are prefixed with `.stomarchy-` to avoid conflicts.
@@ -143,7 +160,7 @@ Internal stomarchy files are prefixed with `.stomarchy-` to avoid conflicts.
 Stomarchy respects XDG Base Directory specifications:
 
 - **Config**: `${XDG_CONFIG_HOME:-$HOME/.config}/stomarchy`
-- **Cache**: `${XDG_CACHE_HOME:-$HOME/.cache}/stomarchy`
+- **Omarchy originals**: `${STOMARCHY_OMARCHY_CONFIG_DIR:-$HOME/.local/share/omarchy/config}`
 
 ## Contributing
 

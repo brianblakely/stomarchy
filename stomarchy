@@ -6,8 +6,9 @@
 #
 # Commands:
 #   add       - Track a file with stomarchy
-#   apply     - Apply tracked customizations to Omarchy configs
-#   sync      - Sync Omarchy defaults from latest release
+#   link      - Link tracked snippets into ~/.config
+#   remove    - Stop tracking a file and restore Omarchy defaults
+#   sync      - Sync current local Omarchy defaults into ~/.config
 #   status    - Show current status of tracked files
 #   help      - Show this help message
 #
@@ -15,10 +16,10 @@
 set -e
 
 VERSION="0.1.0"
-STOMARCHY_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/stomarchy"
-OMARCHY_REPO="basecamp/omarchy"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/stomarchy"
-VERSION_FILE="${STOMARCHY_DIR}/.stomarchy-omarchy-version"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STOMARCHY_DIR="${CONFIG_HOME}/stomarchy"
+STOMARCHY_CONFIG_ROOT="${STOMARCHY_DIR}/.config"
+OMARCHY_CONFIG_DIR="${STOMARCHY_OMARCHY_CONFIG_DIR:-$HOME/.local/share/omarchy/config}"
 
 # Color codes for output
 RED='\033[0;31m'
@@ -47,43 +48,557 @@ log_error() {
 # Initialize directories
 init_dirs() {
     mkdir -p "$STOMARCHY_DIR"
-    mkdir -p "$CACHE_DIR"
 }
 
-# Get latest Omarchy release version
-get_latest_release() {
-    local repo="$1"
-    local release_url="https://api.github.com/repos/${repo}/releases/latest"
-    
-    if command -v curl &> /dev/null; then
-        curl -s "$release_url" | grep -oP '"tag_name": "\K(.*)(?=")'
-    elif command -v wget &> /dev/null; then
-        wget -qO- "$release_url" | grep -oP '"tag_name": "\K(.*)(?=")'
-    else
-        log_error "Neither curl nor wget found. Please install one of them."
-        exit 1
-    fi
-}
-
-# Convert absolute path to stomarchy-relative path
-# Stomarchy root corresponds to $HOME
-get_stomarchy_path() {
+# Convert a ~/.config file path to a path relative to ~/.config.
+get_config_rel_path() {
     local file_path="$1"
     local abs_path
-    abs_path=$(realpath "$file_path" 2>/dev/null || echo "$file_path")
-    
-    # Strip $HOME prefix to get relative path
-    local rel_path="${abs_path#"$HOME"/}"
-    
+    local config_home_abs
+    local rel_path
+
+    abs_path=$(realpath -m "$file_path")
+    config_home_abs=$(realpath -m "$CONFIG_HOME")
+    rel_path="${abs_path#"$config_home_abs"/}"
+
     if [ "$rel_path" = "$abs_path" ]; then
-        log_error "File must be under home directory: $HOME"
+        log_error "File must be under config directory: $CONFIG_HOME"
         exit 1
     fi
-    
-    echo "${STOMARCHY_DIR}/${rel_path}"
+
+    echo "$rel_path"
 }
 
-# Add a file to stomarchy tracking
+get_stomarchy_path() {
+    local config_rel_path="$1"
+    echo "${STOMARCHY_CONFIG_ROOT}/${config_rel_path}"
+}
+
+get_omarchy_original_path() {
+    local config_rel_path="$1"
+    echo "${OMARCHY_CONFIG_DIR}/${config_rel_path}"
+}
+
+get_target_path() {
+    local config_rel_path="$1"
+    echo "${CONFIG_HOME}/${config_rel_path}"
+}
+
+get_config_rel_path_from_tracked() {
+    local tracked_file="$1"
+    local tracked_abs
+    local root_abs
+    local rel_path
+
+    tracked_abs=$(realpath -m "$tracked_file")
+    root_abs=$(realpath -m "$STOMARCHY_CONFIG_ROOT")
+    rel_path="${tracked_abs#"$root_abs"/}"
+
+    if [ "$rel_path" = "$tracked_abs" ]; then
+        return 1
+    fi
+
+    echo "$rel_path"
+}
+
+find_tracked_files() {
+    if [ ! -d "$STOMARCHY_CONFIG_ROOT" ]; then
+        return 0
+    fi
+
+    find "$STOMARCHY_CONFIG_ROOT" -type f -print0
+}
+
+is_supported_config() {
+    local config_rel_path="$1"
+
+    case "$config_rel_path" in
+        hypr/*.conf|hypr/*.lua|kitty/*.conf|ghostty/config|foot/*.ini|tmux/*.conf|*.sh|uwsm/env|uwsm/default)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+escape_double_quoted() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+get_comment_prefix() {
+    local config_rel_path="$1"
+
+    case "$config_rel_path" in
+        hypr/*.lua)
+            echo "--"
+            ;;
+        *)
+            echo "#"
+            ;;
+    esac
+}
+
+get_import_directive() {
+    local config_rel_path="$1"
+    local tracked_file="$2"
+    local tracked_abs
+
+    tracked_abs=$(realpath -m "$tracked_file")
+
+    case "$config_rel_path" in
+        hypr/*.conf)
+            echo "source = ${tracked_abs}"
+            ;;
+        hypr/*.lua)
+            echo "dofile(\"$(escape_double_quoted "$tracked_abs")\")"
+            ;;
+        kitty/*.conf)
+            echo "include ${tracked_abs}"
+            ;;
+        ghostty/config)
+            echo "config-file = \"$(escape_double_quoted "$tracked_abs")\""
+            ;;
+        foot/*.ini)
+            echo "include=${tracked_abs}"
+            ;;
+        tmux/*.conf)
+            echo "source-file \"$(escape_double_quoted "$tracked_abs")\""
+            ;;
+        *.sh|uwsm/env|uwsm/default)
+            echo "source \"$(escape_double_quoted "$tracked_abs")\""
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+strip_stomarchy_blocks() {
+    local input_file="$1"
+    local output_file="$2"
+
+    awk -v stomarchy_dir="$STOMARCHY_DIR" '
+        /BEGIN Stomarchy customizations/ {
+            in_block = 1
+            next
+        }
+        /END Stomarchy customizations/ {
+            in_block = 0
+            next
+        }
+        in_block {
+            next
+        }
+        /Stomarchy customizations/ {
+            legacy_block = 1
+            next
+        }
+        legacy_block {
+            if ($0 == "") {
+                legacy_block = 0
+                print
+                next
+            }
+            if (index($0, "stomarchy") || index($0, stomarchy_dir)) {
+                next
+            }
+            legacy_block = 0
+        }
+        {
+            print
+        }
+    ' "$input_file" > "$output_file"
+}
+
+write_added_lines() {
+    local original_file="$1"
+    local user_file="$2"
+    local output_file="$3"
+
+    awk '
+        NR == FNR {
+            original[$0] = 1
+            next
+        }
+        !($0 in original) {
+            print
+        }
+    ' "$original_file" "$user_file" > "$output_file"
+}
+
+count_removed_lines() {
+    local original_file="$1"
+    local user_file="$2"
+
+    awk '
+        NR == FNR {
+            user[$0] = 1
+            next
+        }
+        !($0 in user) {
+            removed++
+        }
+        END {
+            print removed + 0
+        }
+    ' "$user_file" "$original_file"
+}
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+parse_hypr_bind() {
+    local line="$1"
+    local after_equals
+    local mods
+    local rest
+    local key
+
+    [[ "$line" =~ ^[[:space:]]*bind[^[:space:]=]*[[:space:]]*= ]] || return 1
+    [[ "$line" =~ ^[[:space:]]*unbind[[:space:]]*= ]] && return 1
+
+    after_equals="${line#*=}"
+    mods="${after_equals%%,*}"
+    rest="${after_equals#*,}"
+
+    [ "$rest" = "$after_equals" ] && return 1
+
+    key="${rest%%,*}"
+    mods=$(trim "$mods")
+    key=$(trim "$key")
+
+    [ -n "$mods" ] && [ -n "$key" ] || return 1
+    printf '%s\t%s\n' "$mods" "$key"
+}
+
+hypr_binding_exists() {
+    local original_file="$1"
+    local mods="$2"
+    local key="$3"
+
+    awk -v expected_mods="$mods" -v expected_key="$key" '
+        function trim_value(value) {
+            gsub(/^[ \t]+|[ \t]+$/, "", value)
+            return value
+        }
+        /^[ \t]*bind[^ \t=]*[ \t]*=/ {
+            if ($0 ~ /^[ \t]*unbind[ \t]*=/) {
+                next
+            }
+            line = $0
+            sub(/^[^=]*=/, "", line)
+            split(line, parts, ",")
+            if (trim_value(parts[1]) == expected_mods && trim_value(parts[2]) == expected_key) {
+                found = 1
+                exit
+            }
+        }
+        END {
+            exit found ? 0 : 1
+        }
+    ' "$original_file"
+}
+
+write_hypr_conf_snippet() {
+    local original_file="$1"
+    local added_lines_file="$2"
+    local output_file="$3"
+    local emitted_unbinds=$'\n'
+    local line
+
+    : > "$output_file"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        local parsed
+        local mods
+        local key
+        local unbind_key
+
+        if parsed=$(parse_hypr_bind "$line"); then
+            mods="${parsed%%$'\t'*}"
+            key="${parsed#*$'\t'}"
+            unbind_key="${mods}, ${key}"
+
+            if hypr_binding_exists "$original_file" "$mods" "$key"; then
+                case "$emitted_unbinds" in
+                    *$'\n'"$unbind_key"$'\n'*)
+                        ;;
+                    *)
+                        echo "unbind = ${unbind_key}" >> "$output_file"
+                        emitted_unbinds="${emitted_unbinds}${unbind_key}"$'\n'
+                        ;;
+                esac
+            fi
+        fi
+
+        echo "$line" >> "$output_file"
+    done < "$added_lines_file"
+}
+
+get_lua_bind_key() {
+    local line="$1"
+    local key
+
+    key=$(printf '%s\n' "$line" | sed -nE 's/.*hl[.]bind[[:space:]]*[(][[:space:]]*"([^"]+)".*/\1/p')
+    if [ -z "$key" ]; then
+        key=$(printf '%s\n' "$line" | sed -nE "s/.*hl[.]bind[[:space:]]*[(][[:space:]]*'([^']+)'.*/\1/p")
+    fi
+
+    [ -n "$key" ] || return 1
+    printf '%s' "$key"
+}
+
+lua_binding_exists() {
+    local original_file="$1"
+    local expected_key="$2"
+    local line
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        local key
+
+        if key=$(get_lua_bind_key "$line") && [ "$key" = "$expected_key" ]; then
+            return 0
+        fi
+    done < "$original_file"
+
+    return 1
+}
+
+is_lua_partial_line() {
+    local line="$1"
+
+    [[ "$line" =~ ^[[:space:]]*$ ]] && return 1
+    [[ "$line" =~ ^[[:space:]]*-- ]] && return 1
+    [[ "$line" =~ ^[[:space:]] ]] && return 0
+
+    case "$line" in
+        "}"*|"},"*|"]"*|"],"*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+write_hypr_lua_snippet() {
+    local original_file="$1"
+    local added_lines_file="$2"
+    local output_file="$3"
+    local emitted_unbinds=$'\n'
+    local skipped=false
+    local line
+
+    : > "$output_file"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        local key
+
+        if is_lua_partial_line "$line"; then
+            skipped=true
+            continue
+        fi
+
+        if key=$(get_lua_bind_key "$line"); then
+            if lua_binding_exists "$original_file" "$key"; then
+                case "$emitted_unbinds" in
+                    *$'\n'"$key"$'\n'*)
+                        ;;
+                    *)
+                        echo "hl.unbind(\"$(escape_double_quoted "$key")\")" >> "$output_file"
+                        emitted_unbinds="${emitted_unbinds}${key}"$'\n'
+                        ;;
+                esac
+            fi
+        fi
+
+        echo "$line" >> "$output_file"
+    done < "$added_lines_file"
+
+    [ "$skipped" = false ]
+}
+
+generate_snippet() {
+    local original_file="$1"
+    local user_file="$2"
+    local config_rel_path="$3"
+    local output_file="$4"
+    local added_lines_file
+    local removed_count
+    local skipped_partial=false
+
+    if diff -q "$original_file" "$user_file" > /dev/null; then
+        : > "$output_file"
+        log_info "No runtime changes detected; created an empty no-op snippet"
+        return 0
+    fi
+
+    added_lines_file=$(mktemp)
+    write_added_lines "$original_file" "$user_file" "$added_lines_file"
+    removed_count=$(count_removed_lines "$original_file" "$user_file")
+
+    case "$config_rel_path" in
+        hypr/*.conf)
+            write_hypr_conf_snippet "$original_file" "$added_lines_file" "$output_file"
+            ;;
+        hypr/*.lua)
+            if ! write_hypr_lua_snippet "$original_file" "$added_lines_file" "$output_file"; then
+                skipped_partial=true
+            fi
+            ;;
+        *)
+            cp "$added_lines_file" "$output_file"
+            ;;
+    esac
+
+    rm -f "$added_lines_file"
+
+    if [ "$skipped_partial" = true ]; then
+        log_warn "Skipped Lua edits that are not safe as standalone top-level snippets"
+    fi
+
+    if [ "$removed_count" -gt 0 ]; then
+        if [ -s "$output_file" ]; then
+            log_warn "Some deletions or reorders cannot be represented as runtime snippets"
+        else
+            log_warn "Only deletions or reorders detected; created an empty no-op snippet"
+        fi
+    elif [ ! -s "$output_file" ]; then
+        log_info "No runtime changes detected; created an empty no-op snippet"
+    fi
+}
+
+append_import_block() {
+    local output_file="$1"
+    local config_rel_path="$2"
+    local import_directive="$3"
+    local comment_prefix
+
+    comment_prefix=$(get_comment_prefix "$config_rel_path")
+
+    {
+        echo ""
+        echo "${comment_prefix} BEGIN Stomarchy customizations"
+        echo "$import_directive"
+        echo "${comment_prefix} END Stomarchy customizations"
+    } >> "$output_file"
+}
+
+restore_target_with_import() {
+    local config_rel_path="$1"
+    local tracked_file="$2"
+    local original_file="$3"
+    local target_file
+    local import_directive
+    local desired_file
+
+    target_file=$(get_target_path "$config_rel_path")
+    import_directive=$(get_import_directive "$config_rel_path" "$tracked_file")
+
+    desired_file=$(mktemp)
+    cp -p "$original_file" "$desired_file"
+    append_import_block "$desired_file" "$config_rel_path" "$import_directive"
+
+    if [ -f "$target_file" ] && cmp -s "$target_file" "$desired_file"; then
+        log_info "Target already restored with Stomarchy import: $target_file"
+        rm -f "$desired_file"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target_file")"
+
+    if [ -f "$target_file" ]; then
+        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
+        cp -p "$target_file" "$backup_file"
+        log_info "Backed up current config to: $backup_file"
+    fi
+
+    cp -p "$desired_file" "$target_file"
+    rm -f "$desired_file"
+
+    log_info "Restored Omarchy default and added import directive to: $target_file"
+}
+
+restore_target_base() {
+    local config_rel_path="$1"
+    local original_file="$2"
+    local target_file
+
+    target_file=$(get_target_path "$config_rel_path")
+
+    if [ -f "$target_file" ] && cmp -s "$target_file" "$original_file"; then
+        log_info "Target already matches Omarchy default: $target_file"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target_file")"
+
+    if [ -f "$target_file" ]; then
+        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
+        cp -p "$target_file" "$backup_file"
+        log_info "Backed up current config to: $backup_file"
+    fi
+
+    cp -p "$original_file" "$target_file"
+    log_info "Restored Omarchy default to: $target_file"
+}
+
+write_synced_target() {
+    local config_rel_path="$1"
+    local original_file="$2"
+    local target_file
+    local tracked_file
+    local desired_file
+    local import_applied=false
+
+    target_file=$(get_target_path "$config_rel_path")
+    tracked_file=$(get_stomarchy_path "$config_rel_path")
+    desired_file=$(mktemp)
+
+    cp -p "$original_file" "$desired_file"
+
+    if [ -f "$tracked_file" ]; then
+        if is_supported_config "$config_rel_path"; then
+            append_import_block "$desired_file" "$config_rel_path" "$(get_import_directive "$config_rel_path" "$tracked_file")"
+            import_applied=true
+        else
+            log_warn "Tracked snippet uses unsupported format, skipping import: $tracked_file"
+        fi
+    fi
+
+    if [ -f "$target_file" ] && cmp -s "$target_file" "$desired_file"; then
+        rm -f "$desired_file"
+        if [ "$import_applied" = true ]; then
+            SYNC_RESULT="unchanged_import"
+        else
+            SYNC_RESULT="unchanged"
+        fi
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$target_file")"
+
+    if [ -f "$target_file" ]; then
+        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
+        cp -p "$target_file" "$backup_file"
+        log_info "Backed up current config to: $backup_file"
+    fi
+
+    cp -p "$desired_file" "$target_file"
+    rm -f "$desired_file"
+
+    if [ "$import_applied" = true ]; then
+        SYNC_RESULT="synced_import"
+    else
+        SYNC_RESULT="synced"
+    fi
+}
+
+# Track a config snippet and update the target file
 cmd_add() {
     if [ -z "$1" ]; then
         log_error "Usage: stomarchy add <file>"
@@ -96,172 +611,232 @@ cmd_add() {
         log_error "File not found: $source_file"
         exit 1
     fi
-    
+
     init_dirs
-    
+
+    local config_rel_path
+    config_rel_path=$(get_config_rel_path "$source_file")
+
+    if ! is_supported_config "$config_rel_path"; then
+        log_error "Unsupported config format: ~/.config/${config_rel_path}"
+        log_info "Supported formats: Hyprland .conf/.lua, kitty, ghostty, foot, tmux, and shell-style files"
+        exit 1
+    fi
+
+    local original_file
+    original_file=$(get_omarchy_original_path "$config_rel_path")
+
+    if [ ! -f "$original_file" ]; then
+        log_error "Omarchy original not found: $original_file"
+        log_info "Stomarchy can only track files that have untouched originals in $OMARCHY_CONFIG_DIR"
+        exit 1
+    fi
+
     local stomarchy_path
-    stomarchy_path=$(get_stomarchy_path "$source_file")
-    
+    stomarchy_path=$(get_stomarchy_path "$config_rel_path")
+
     # Create directory structure
     mkdir -p "$(dirname "$stomarchy_path")"
-    
-    # Copy file to stomarchy directory
-    cp "$source_file" "$stomarchy_path"
-    
+
+    local cleaned_source
+    local source_is_managed=false
+    cleaned_source=$(mktemp)
+    strip_stomarchy_blocks "$source_file" "$cleaned_source"
+
+    if [ -f "$stomarchy_path" ] && grep -Eq "BEGIN Stomarchy customizations|Stomarchy customizations" "$source_file"; then
+        source_is_managed=true
+    fi
+
+    if [ "$source_is_managed" = true ]; then
+        log_info "Managed target detected; keeping existing tracked snippet"
+    elif [ -f "$stomarchy_path" ] && diff -q "$original_file" "$cleaned_source" > /dev/null; then
+        log_info "Target is already restored; keeping existing tracked snippet"
+    else
+        generate_snippet "$original_file" "$cleaned_source" "$config_rel_path" "$stomarchy_path"
+    fi
+
+    rm -f "$cleaned_source"
+
+    restore_target_with_import "$config_rel_path" "$stomarchy_path" "$original_file"
+
     log_success "Added: $source_file"
     log_info "Tracked at: $stomarchy_path"
-    log_info "Use 'stomarchy apply' to add source directives to Omarchy configs"
+    log_info "Snippet generated or preserved from differences with: $original_file"
 }
 
-# Apply tracked customizations by appending source directives
-cmd_apply() {
-    log_info "Applying tracked customizations..."
-    init_dirs
-    
-    if [ ! -d "$STOMARCHY_DIR" ]; then
-        log_error "No tracked files found. Use 'stomarchy add <file>' first."
+# Stop tracking a config file and restore the Omarchy default
+cmd_remove() {
+    if [ -z "$1" ]; then
+        log_error "Usage: stomarchy remove <file>"
         exit 1
     fi
-    
-    local files_processed=0
-    
-    # Process each tracked file (skip dotfiles that are stomarchy internals)
-    while IFS= read -r -d '' tracked_file; do
-        # Get relative path from stomarchy dir
-        local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
-        
-        # Skip stomarchy internal files (dotfiles starting with .stomarchy-)
-        local filename
-        filename=$(basename "$tracked_file")
-        if [[ "$filename" == .stomarchy-* ]]; then
-            continue
-        fi
-        
-        # The corresponding file in home directory
-        local target_file="${HOME}/${rel_path}"
-        
-        if [ ! -f "$target_file" ]; then
-            log_warn "Target file not found, skipping: $target_file"
-            continue
-        fi
-        
-        # Determine source directive syntax based on file extension
-        local source_directive
-        case "${rel_path##*.}" in
-            conf)
-                source_directive="source = ${tracked_file}"
-                ;;
-            sh)
-                source_directive="source \"${tracked_file}\""
-                ;;
-            *)
-                source_directive="source ${tracked_file}"
-                ;;
-        esac
-        
-        # Add directive if not already present
-        if ! grep -Fq "$tracked_file" "$target_file" 2>/dev/null; then
-            {
-                echo ""
-                echo "# Stomarchy customizations"
-                echo "$source_directive"
-            } >> "$target_file"
-            log_info "Added import directive to: $target_file"
-            files_processed=$((files_processed + 1))
-        else
-            log_info "Already applied: $target_file"
-        fi
-    done < <(find "$STOMARCHY_DIR" -type f -print0)
-    
-    if [ "$files_processed" -eq 0 ]; then
-        log_info "No new customizations to apply"
+
+    init_dirs
+
+    local target_arg="$1"
+    local config_rel_path
+    config_rel_path=$(get_config_rel_path "$target_arg")
+
+    local original_file
+    original_file=$(get_omarchy_original_path "$config_rel_path")
+
+    if [ ! -f "$original_file" ]; then
+        log_error "Omarchy original not found: $original_file"
+        log_info "Stomarchy can only restore files that have untouched originals in $OMARCHY_CONFIG_DIR"
+        exit 1
+    fi
+
+    local stomarchy_path
+    stomarchy_path=$(get_stomarchy_path "$config_rel_path")
+
+    if [ -f "$stomarchy_path" ]; then
+        rm -f "$stomarchy_path"
+        log_info "Removed tracked snippet: $stomarchy_path"
     else
-        log_success "Applied $files_processed customization(s)"
+        log_info "No tracked snippet found for: ~/.config/${config_rel_path}"
     fi
+
+    restore_target_base "$config_rel_path" "$original_file"
+
+    log_success "Removed: $target_arg"
 }
 
-# Sync Omarchy defaults from latest release
-cmd_sync() {
-    log_info "Syncing Omarchy defaults from latest release..."
+link_tracked_file() {
+    local tracked_file="$1"
+    local config_rel_path
+
+    if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
+        log_warn "Unsupported tracked path, skipping: $tracked_file"
+        return 1
+    fi
+
+    if ! is_supported_config "$config_rel_path"; then
+        log_warn "Unsupported config format, skipping: ~/.config/${config_rel_path}"
+        return 1
+    fi
+
+    local original_file
+    original_file=$(get_omarchy_original_path "$config_rel_path")
+
+    if [ ! -f "$original_file" ]; then
+        log_warn "Omarchy original not found, skipping: $original_file"
+        return 1
+    fi
+
+    restore_target_with_import "$config_rel_path" "$tracked_file" "$original_file"
+    log_info "Linked: ~/.config/${config_rel_path}"
+    return 0
+}
+
+# Link checked-out tracked snippets into ~/.config
+cmd_link() {
     init_dirs
-    
-    local latest_version
-    latest_version=$(get_latest_release "$OMARCHY_REPO")
-    
-    if [ -z "$latest_version" ]; then
-        log_error "Failed to fetch latest Omarchy release"
-        exit 1
-    fi
-    
-    log_info "Latest Omarchy version: $latest_version"
-    
-    local current_version=""
-    
-    if [ -f "$VERSION_FILE" ]; then
-        current_version=$(cat "$VERSION_FILE")
-        log_info "Current tracked version: $current_version"
-    fi
-    
-    if [ "$current_version" = "$latest_version" ]; then
-        log_success "Already at latest version: $latest_version"
-        return 0
-    fi
-    
-    # Download and compare configs
-    local temp_dir="${CACHE_DIR}/omarchy-${latest_version}"
-    
-    if [ ! -d "$temp_dir" ]; then
-        log_info "Downloading Omarchy $latest_version..."
-        mkdir -p "$temp_dir"
-        
-        local archive_url="https://github.com/${OMARCHY_REPO}/archive/refs/tags/${latest_version}.tar.gz"
-        
-        if command -v curl &> /dev/null; then
-            curl -sL "$archive_url" | tar xz -C "$temp_dir" --strip-components=1
-        elif command -v wget &> /dev/null; then
-            wget -qO- "$archive_url" | tar xz -C "$temp_dir" --strip-components=1
+
+    local linked_count=0
+    local skipped_count=0
+    local tracked_file
+    local filename
+
+    if [ -n "${1:-}" ]; then
+        local link_arg="$1"
+        local config_rel_path
+
+        if config_rel_path=$(get_config_rel_path_from_tracked "$link_arg"); then
+            tracked_file=$(realpath -m "$link_arg")
         else
-            log_error "Neither curl nor wget found."
+            config_rel_path=$(get_config_rel_path "$link_arg")
+            tracked_file=$(get_stomarchy_path "$config_rel_path")
+        fi
+
+        if [ ! -f "$tracked_file" ]; then
+            log_error "Tracked snippet not found: $tracked_file"
             exit 1
         fi
+
+        if link_tracked_file "$tracked_file"; then
+            linked_count=$((linked_count + 1))
+        else
+            skipped_count=$((skipped_count + 1))
+        fi
+    else
+        while IFS= read -r -d '' tracked_file; do
+            filename=$(basename "$tracked_file")
+            if [[ "$filename" == .stomarchy-* ]]; then
+                continue
+            fi
+
+            if link_tracked_file "$tracked_file"; then
+                linked_count=$((linked_count + 1))
+            else
+                skipped_count=$((skipped_count + 1))
+            fi
+        done < <(find_tracked_files)
     fi
-    
-    # Show differences against tracked files
-    log_info "Changes in default configs:"
-    
-    local has_changes=false
+
+    if [ "$linked_count" -eq 0 ]; then
+        log_warn "No tracked snippets linked"
+    else
+        log_success "Linked $linked_count tracked snippet(s), skipped $skipped_count"
+    fi
+}
+
+# Sync user configs from the current local Omarchy defaults
+cmd_sync() {
+    log_info "Syncing ~/.config from current Omarchy defaults..."
+    init_dirs
+
+    if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
+        log_error "Omarchy config directory not found: $OMARCHY_CONFIG_DIR"
+        exit 1
+    fi
+
+    local files_synced=0
+    local files_unchanged=0
+    local imports_applied=0
+
+    while IFS= read -r -d '' original_file; do
+        local config_rel_path="${original_file#"$OMARCHY_CONFIG_DIR"/}"
+
+        SYNC_RESULT=""
+        write_synced_target "$config_rel_path" "$original_file"
+
+        case "$SYNC_RESULT" in
+            synced)
+                files_synced=$((files_synced + 1))
+                ;;
+            synced_import)
+                files_synced=$((files_synced + 1))
+                imports_applied=$((imports_applied + 1))
+                ;;
+            unchanged)
+                files_unchanged=$((files_unchanged + 1))
+                ;;
+            unchanged_import)
+                files_unchanged=$((files_unchanged + 1))
+                imports_applied=$((imports_applied + 1))
+                ;;
+        esac
+    done < <(find "$OMARCHY_CONFIG_DIR" -type f -print0)
+
     while IFS= read -r -d '' tracked_file; do
-        local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
-        
         # Skip stomarchy internal files
         local filename
         filename=$(basename "$tracked_file")
         if [[ "$filename" == .stomarchy-* ]]; then
             continue
         fi
-        
-        # Look for corresponding file in downloaded release
-        local release_file="${temp_dir}/${rel_path}"
-        if [ -f "$release_file" ]; then
-            local diff_output
-            diff_output=$(diff -u "$tracked_file" "$release_file" 2>/dev/null) || true
-            if [ -n "$diff_output" ]; then
-                echo "=== $rel_path ==="
-                echo "$diff_output" | head -30
-                echo ""
-                has_changes=true
-            fi
+
+        local config_rel_path
+        if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
+            continue
         fi
-    done < <(find "$STOMARCHY_DIR" -type f -print0)
-    
-    if [ "$has_changes" = false ]; then
-        log_info "No changes detected in tracked files"
-    fi
-    
-    # Update version tracking
-    echo "$latest_version" > "$VERSION_FILE"
-    log_success "Updated version tracking to: $latest_version"
-    log_info "To apply updates, reinstall Omarchy and run 'stomarchy apply'"
+
+        if [ ! -f "${OMARCHY_CONFIG_DIR}/${config_rel_path}" ]; then
+            log_warn "Tracked snippet has no current Omarchy original, skipping: $tracked_file"
+        fi
+    done < <(find_tracked_files)
+
+    log_success "Synced $files_synced file(s), left $files_unchanged unchanged, applied $imports_applied import block(s)"
 }
 
 # Show status
@@ -276,21 +851,19 @@ cmd_status() {
         log_warn "Stomarchy directory not found: $STOMARCHY_DIR"
     fi
     
-    # Check version tracking
+    # Check Omarchy config mirror
     echo ""
-    log_info "Version Tracking:"
-    if [ -f "$VERSION_FILE" ]; then
-        local current_version
-        current_version=$(cat "$VERSION_FILE")
-        echo "  Tracked version: $current_version"
+    log_info "Omarchy Defaults:"
+    if [ -d "$OMARCHY_CONFIG_DIR" ]; then
+        echo "  Source: $OMARCHY_CONFIG_DIR"
     else
-        echo "  No version tracked yet"
+        echo "  Missing: $OMARCHY_CONFIG_DIR"
     fi
     
     # List tracked files
     echo ""
     log_info "Tracked Files:"
-    if [ -d "$STOMARCHY_DIR" ]; then
+    if [ -d "$STOMARCHY_CONFIG_ROOT" ]; then
         local file_count=0
         while IFS= read -r -d '' tracked_file; do
             local filename
@@ -300,10 +873,14 @@ cmd_status() {
                 continue
             fi
             
-            local rel_path="${tracked_file#"$STOMARCHY_DIR"/}"
-            echo "  ~/${rel_path}"
+            local config_rel_path
+            if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
+                continue
+            fi
+
+            echo "  ~/.config/${config_rel_path}"
             file_count=$((file_count + 1))
-        done < <(find "$STOMARCHY_DIR" -type f -print0)
+        done < <(find_tracked_files)
         
         if [ "$file_count" -eq 0 ]; then
             echo "  (none)"
@@ -326,40 +903,44 @@ USAGE:
     stomarchy [COMMAND] [OPTIONS]
 
 COMMANDS:
-    add <file>          Track a file with stomarchy
-    apply               Apply tracked customizations to Omarchy configs
-    sync                Sync with latest Omarchy release and show changes
+    add <file>          Track diff-only changes and update the config file
+    link [file]         Link checked-out tracked snippets into ~/.config
+    remove <file>       Stop tracking a file and restore Omarchy defaults
+    sync                Copy current Omarchy defaults into ~/.config
     status              Show current status and tracked files
     help                Show this help message
 
 EXAMPLES:
-    # Track a config file
+    # Track diff-only changes and update the config file
     stomarchy add ~/.config/hypr/hyprland.conf
 
-    # Apply source directives to Omarchy configs
-    stomarchy apply
+    # Link checked-out tracked snippets into ~/.config
+    stomarchy link
 
-    # Check for Omarchy updates
+    # Stop tracking a file and restore the Omarchy default
+    stomarchy remove ~/.config/hypr/hyprland.conf
+
+    # Sync current Omarchy defaults into ~/.config
     stomarchy sync
 
     # View status
     stomarchy status
 
 DIRECTORY STRUCTURE:
-    Files are tracked under ~/.config/stomarchy/ with the same
-    directory structure as your home directory:
-    
-    ~/                              ~/.config/stomarchy/
-    ├── .config/                    ├── .config/
-    │   └── hypr/                   │   └── hypr/
-    │       └── hyprland.conf       │       └── hyprland.conf
-    └── .bashrc                     └── .bashrc
+    Diff-only snippets are tracked under ~/.config/stomarchy/ with
+    the same structure as ~/.config:
+
+    ~/.config/                      ~/.config/stomarchy/
+    ├── hypr/                       ├── .config/
+    │   ├── hyprland.conf           │   └── hypr/
+    │   └── hyprland.lua            │       ├── hyprland.conf
+    │                               │       └── hyprland.lua
 
     Use git to version control your ~/.config/stomarchy/ directory.
 
 DIRECTORIES:
     Config:     ${STOMARCHY_DIR}
-    Cache:      ${CACHE_DIR}
+    Omarchy:    ${OMARCHY_CONFIG_DIR}
 
 For more information, visit: https://github.com/brianblakely/stomarchy
 EOF
@@ -374,8 +955,13 @@ main() {
             shift
             cmd_add "$@"
             ;;
-        apply)
-            cmd_apply
+        link)
+            shift
+            cmd_link "$@"
+            ;;
+        remove)
+            shift
+            cmd_remove "$@"
             ;;
         sync)
             cmd_sync
