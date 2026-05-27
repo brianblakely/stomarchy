@@ -6,10 +6,10 @@
 #
 # Commands:
 #   add       - Track a file with stomarchy
-#   link      - Link tracked snippets into ~/.config
+#   link      - Link tweaks into local target files
 #   remove    - Stop tracking a file and restore Omarchy defaults
-#   sync      - Sync current local Omarchy defaults into ~/.config
-#   status    - Show current status of tracked files
+#   sync      - Sync current local Omarchy defaults into local target files
+#   status    - Show current status of tweaks
 #   help      - Show this help message
 #
 
@@ -50,28 +50,50 @@ init_dirs() {
     mkdir -p "$STOMARCHY_DIR"
 }
 
-# Convert a ~/.config file path to a path relative to ~/.config.
+# Convert a supported target file path to the matching Omarchy config path.
 get_config_rel_path() {
     local file_path="$1"
     local abs_path
     local config_home_abs
+    local home_abs
     local rel_path
 
     abs_path=$(realpath -m "$file_path")
     config_home_abs=$(realpath -m "$CONFIG_HOME")
+    home_abs=$(realpath -m "$HOME")
     rel_path="${abs_path#"$config_home_abs"/}"
 
-    if [ "$rel_path" = "$abs_path" ]; then
-        log_error "File must be under config directory: $CONFIG_HOME"
-        exit 1
+    if [ "$rel_path" != "$abs_path" ]; then
+        echo "$rel_path"
+        return 0
     fi
 
-    echo "$rel_path"
+    case "$abs_path" in
+        "$home_abs/.bashrc")
+            echo ".bashrc"
+            return 0
+            ;;
+        "$home_abs/.inputrc")
+            echo ".inputrc"
+            return 0
+            ;;
+    esac
+
+    log_error "File must be under config directory ($CONFIG_HOME) or be ~/.bashrc or ~/.inputrc"
+    exit 1
 }
 
 get_stomarchy_path() {
     local config_rel_path="$1"
-    echo "${STOMARCHY_CONFIG_ROOT}/${config_rel_path}"
+
+    case "$config_rel_path" in
+        .bashrc|.inputrc)
+            echo "${STOMARCHY_DIR}/${config_rel_path}"
+            ;;
+        *)
+            echo "${STOMARCHY_CONFIG_ROOT}/${config_rel_path}"
+            ;;
+    esac
 }
 
 get_omarchy_original_path() {
@@ -81,39 +103,81 @@ get_omarchy_original_path() {
 
 get_target_path() {
     local config_rel_path="$1"
-    echo "${CONFIG_HOME}/${config_rel_path}"
+
+    case "$config_rel_path" in
+        .bashrc|.inputrc)
+            echo "${HOME}/${config_rel_path}"
+            ;;
+        *)
+            echo "${CONFIG_HOME}/${config_rel_path}"
+            ;;
+    esac
 }
 
 get_config_rel_path_from_tracked() {
     local tracked_file="$1"
     local tracked_abs
     local root_abs
+    local bashrc_abs
+    local inputrc_abs
     local rel_path
 
     tracked_abs=$(realpath -m "$tracked_file")
     root_abs=$(realpath -m "$STOMARCHY_CONFIG_ROOT")
+    bashrc_abs=$(realpath -m "$STOMARCHY_DIR/.bashrc")
+    inputrc_abs=$(realpath -m "$STOMARCHY_DIR/.inputrc")
     rel_path="${tracked_abs#"$root_abs"/}"
 
-    if [ "$rel_path" = "$tracked_abs" ]; then
-        return 1
-    fi
-
-    echo "$rel_path"
-}
-
-find_tracked_files() {
-    if [ ! -d "$STOMARCHY_CONFIG_ROOT" ]; then
+    if [ "$rel_path" != "$tracked_abs" ]; then
+        echo "$rel_path"
         return 0
     fi
 
-    find "$STOMARCHY_CONFIG_ROOT" -type f -print0
+    if [ "$tracked_abs" = "$bashrc_abs" ]; then
+        echo ".bashrc"
+        return 0
+    fi
+
+    if [ "$tracked_abs" = "$inputrc_abs" ]; then
+        echo ".inputrc"
+        return 0
+    fi
+
+    return 1
+}
+
+find_tracked_files() {
+    local tracked_dotfile
+
+    if [ -d "$STOMARCHY_CONFIG_ROOT" ]; then
+        find "$STOMARCHY_CONFIG_ROOT" -type f -print0
+    fi
+
+    for tracked_dotfile in "$STOMARCHY_DIR/.bashrc" "$STOMARCHY_DIR/.inputrc"; do
+        if [ -f "$tracked_dotfile" ]; then
+            printf '%s\0' "$tracked_dotfile"
+        fi
+    done
+}
+
+format_target_label() {
+    local config_rel_path="$1"
+
+    case "$config_rel_path" in
+        .bashrc|.inputrc)
+            echo "~/${config_rel_path}"
+            ;;
+        *)
+            echo "~/.config/${config_rel_path}"
+            ;;
+    esac
 }
 
 is_supported_config() {
     local config_rel_path="$1"
 
     case "$config_rel_path" in
-        hypr/*.conf|hypr/*.lua|kitty/*.conf|ghostty/config|foot/*.ini|tmux/*.conf|*.sh|uwsm/env|uwsm/default)
+        hypr/*.conf|hypr/*.lua|kitty/*.conf|ghostty/config|foot/*.ini|tmux/*.conf|*.sh|.bashrc|.inputrc|uwsm/env|uwsm/default)
             return 0
             ;;
         *)
@@ -165,7 +229,10 @@ get_import_directive() {
         tmux/*.conf)
             echo "source-file \"$(escape_double_quoted "$tracked_abs")\""
             ;;
-        *.sh|uwsm/env|uwsm/default)
+        .inputrc)
+            echo "\$include ${tracked_abs}"
+            ;;
+        *.sh|.bashrc|uwsm/env|uwsm/default)
             echo "source \"$(escape_double_quoted "$tracked_abs")\""
             ;;
         *)
@@ -304,7 +371,7 @@ hypr_binding_exists() {
     ' "$original_file"
 }
 
-write_hypr_conf_snippet() {
+write_hypr_conf_tweak() {
     local original_file="$1"
     local added_lines_file="$2"
     local output_file="$3"
@@ -385,7 +452,7 @@ is_lua_partial_line() {
     return 1
 }
 
-write_hypr_lua_snippet() {
+write_hypr_lua_tweak() {
     local original_file="$1"
     local added_lines_file="$2"
     local output_file="$3"
@@ -422,7 +489,7 @@ write_hypr_lua_snippet() {
     [ "$skipped" = false ]
 }
 
-generate_snippet() {
+generate_tweak() {
     local original_file="$1"
     local user_file="$2"
     local config_rel_path="$3"
@@ -433,7 +500,7 @@ generate_snippet() {
 
     if diff -q "$original_file" "$user_file" > /dev/null; then
         : > "$output_file"
-        log_info "No runtime changes detected; created an empty no-op snippet"
+        log_info "No runtime changes detected; created an empty no-op tweak"
         return 0
     fi
 
@@ -443,10 +510,10 @@ generate_snippet() {
 
     case "$config_rel_path" in
         hypr/*.conf)
-            write_hypr_conf_snippet "$original_file" "$added_lines_file" "$output_file"
+            write_hypr_conf_tweak "$original_file" "$added_lines_file" "$output_file"
             ;;
         hypr/*.lua)
-            if ! write_hypr_lua_snippet "$original_file" "$added_lines_file" "$output_file"; then
+            if ! write_hypr_lua_tweak "$original_file" "$added_lines_file" "$output_file"; then
                 skipped_partial=true
             fi
             ;;
@@ -458,17 +525,17 @@ generate_snippet() {
     rm -f "$added_lines_file"
 
     if [ "$skipped_partial" = true ]; then
-        log_warn "Skipped Lua edits that are not safe as standalone top-level snippets"
+        log_warn "Skipped Lua edits that are not safe as standalone top-level tweaks"
     fi
 
     if [ "$removed_count" -gt 0 ]; then
         if [ -s "$output_file" ]; then
-            log_warn "Some deletions or reorders cannot be represented as runtime snippets"
+            log_warn "Some deletions or reorders cannot be represented as runtime tweaks"
         else
-            log_warn "Only deletions or reorders detected; created an empty no-op snippet"
+            log_warn "Only deletions or reorders detected; created an empty no-op tweak"
         fi
     elif [ ! -s "$output_file" ]; then
-        log_info "No runtime changes detected; created an empty no-op snippet"
+        log_info "No runtime changes detected; created an empty no-op tweak"
     fi
 }
 
@@ -566,7 +633,7 @@ write_synced_target() {
             append_import_block "$desired_file" "$config_rel_path" "$(get_import_directive "$config_rel_path" "$tracked_file")"
             import_applied=true
         else
-            log_warn "Tracked snippet uses unsupported format, skipping import: $tracked_file"
+            log_warn "Tweak uses unsupported format, skipping import: $tracked_file"
         fi
     fi
 
@@ -598,7 +665,7 @@ write_synced_target() {
     fi
 }
 
-# Track a config snippet and update the target file
+# Track a tweak and update the target file
 cmd_add() {
     if [ -z "$1" ]; then
         log_error "Usage: stomarchy add <file>"
@@ -618,8 +685,8 @@ cmd_add() {
     config_rel_path=$(get_config_rel_path "$source_file")
 
     if ! is_supported_config "$config_rel_path"; then
-        log_error "Unsupported config format: ~/.config/${config_rel_path}"
-        log_info "Supported formats: Hyprland .conf/.lua, kitty, ghostty, foot, tmux, and shell-style files"
+        log_error "Unsupported config format: $(format_target_label "$config_rel_path")"
+        log_info "Supported formats: Hyprland .conf/.lua, kitty, ghostty, foot, tmux, ~/.bashrc, ~/.inputrc, and shell-style files"
         exit 1
     fi
 
@@ -648,11 +715,11 @@ cmd_add() {
     fi
 
     if [ "$source_is_managed" = true ]; then
-        log_info "Managed target detected; keeping existing tracked snippet"
+        log_info "Managed target detected; keeping existing tweak"
     elif [ -f "$stomarchy_path" ] && diff -q "$original_file" "$cleaned_source" > /dev/null; then
-        log_info "Target is already restored; keeping existing tracked snippet"
+        log_info "Target is already restored; keeping existing tweak"
     else
-        generate_snippet "$original_file" "$cleaned_source" "$config_rel_path" "$stomarchy_path"
+        generate_tweak "$original_file" "$cleaned_source" "$config_rel_path" "$stomarchy_path"
     fi
 
     rm -f "$cleaned_source"
@@ -660,11 +727,11 @@ cmd_add() {
     restore_target_with_import "$config_rel_path" "$stomarchy_path" "$original_file"
 
     log_success "Added: $source_file"
-    log_info "Tracked at: $stomarchy_path"
-    log_info "Snippet generated or preserved from differences with: $original_file"
+    log_info "Tweak at: $stomarchy_path"
+    log_info "Tweak generated or preserved from differences with: $original_file"
 }
 
-# Stop tracking a config file and restore the Omarchy default
+# Stop tracking a local file and restore the Omarchy default
 cmd_remove() {
     if [ -z "$1" ]; then
         log_error "Usage: stomarchy remove <file>"
@@ -691,9 +758,9 @@ cmd_remove() {
 
     if [ -f "$stomarchy_path" ]; then
         rm -f "$stomarchy_path"
-        log_info "Removed tracked snippet: $stomarchy_path"
+        log_info "Removed tweak: $stomarchy_path"
     else
-        log_info "No tracked snippet found for: ~/.config/${config_rel_path}"
+        log_info "No tweak found for: $(format_target_label "$config_rel_path")"
     fi
 
     restore_target_base "$config_rel_path" "$original_file"
@@ -706,12 +773,12 @@ link_tracked_file() {
     local config_rel_path
 
     if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
-        log_warn "Unsupported tracked path, skipping: $tracked_file"
+        log_warn "Unsupported tweak path, skipping: $tracked_file"
         return 1
     fi
 
     if ! is_supported_config "$config_rel_path"; then
-        log_warn "Unsupported config format, skipping: ~/.config/${config_rel_path}"
+        log_warn "Unsupported config format, skipping: $(format_target_label "$config_rel_path")"
         return 1
     fi
 
@@ -724,11 +791,11 @@ link_tracked_file() {
     fi
 
     restore_target_with_import "$config_rel_path" "$tracked_file" "$original_file"
-    log_info "Linked: ~/.config/${config_rel_path}"
+    log_info "Linked: $(format_target_label "$config_rel_path")"
     return 0
 }
 
-# Link checked-out tracked snippets into ~/.config
+# Link checked-out tweaks into local files
 cmd_link() {
     init_dirs
 
@@ -749,7 +816,7 @@ cmd_link() {
         fi
 
         if [ ! -f "$tracked_file" ]; then
-            log_error "Tracked snippet not found: $tracked_file"
+            log_error "Tweak not found: $tracked_file"
             exit 1
         fi
 
@@ -774,15 +841,15 @@ cmd_link() {
     fi
 
     if [ "$linked_count" -eq 0 ]; then
-        log_warn "No tracked snippets linked"
+        log_warn "No tweaks linked"
     else
-        log_success "Linked $linked_count tracked snippet(s), skipped $skipped_count"
+        log_success "Linked $linked_count tweak(s), skipped $skipped_count"
     fi
 }
 
 # Sync user configs from the current local Omarchy defaults
 cmd_sync() {
-    log_info "Syncing ~/.config from current Omarchy defaults..."
+    log_info "Syncing local targets from current Omarchy defaults..."
     init_dirs
 
     if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
@@ -832,7 +899,7 @@ cmd_sync() {
         fi
 
         if [ ! -f "${OMARCHY_CONFIG_DIR}/${config_rel_path}" ]; then
-            log_warn "Tracked snippet has no current Omarchy original, skipping: $tracked_file"
+            log_warn "Tweak has no current Omarchy original, skipping: $tracked_file"
         fi
     done < <(find_tracked_files)
 
@@ -860,10 +927,10 @@ cmd_status() {
         echo "  Missing: $OMARCHY_CONFIG_DIR"
     fi
     
-    # List tracked files
+    # List tweaks
     echo ""
-    log_info "Tracked Files:"
-    if [ -d "$STOMARCHY_CONFIG_ROOT" ]; then
+    log_info "Tweaks:"
+    if [ -d "$STOMARCHY_DIR" ]; then
         local file_count=0
         while IFS= read -r -d '' tracked_file; do
             local filename
@@ -878,7 +945,7 @@ cmd_status() {
                 continue
             fi
 
-            echo "  ~/.config/${config_rel_path}"
+            echo "  $(format_target_label "$config_rel_path")"
             file_count=$((file_count + 1))
         done < <(find_tracked_files)
         
@@ -886,7 +953,7 @@ cmd_status() {
             echo "  (none)"
         else
             echo ""
-            echo "  Total: $file_count file(s)"
+            echo "  Total: $file_count tweak(s)"
         fi
     else
         echo "  (none)"
@@ -903,38 +970,41 @@ USAGE:
     stomarchy [COMMAND] [OPTIONS]
 
 COMMANDS:
-    add <file>          Track diff-only changes and update the config file
-    link [file]         Link checked-out tracked snippets into ~/.config
+    add <file>          Track diff-only changes and update the local file
+    link [file]         Link checked-out tweaks into local files
     remove <file>       Stop tracking a file and restore Omarchy defaults
-    sync                Copy current Omarchy defaults into ~/.config
-    status              Show current status and tracked files
+    sync                Copy current Omarchy defaults into local files
+    status              Show current status and tweaks
     help                Show this help message
 
 EXAMPLES:
-    # Track diff-only changes and update the config file
+    # Track diff-only changes and update the local file
     stomarchy add ~/.config/hypr/hyprland.conf
+    stomarchy add ~/.bashrc
+    stomarchy add ~/.inputrc
 
-    # Link checked-out tracked snippets into ~/.config
+    # Link checked-out tweaks into local files
     stomarchy link
 
     # Stop tracking a file and restore the Omarchy default
     stomarchy remove ~/.config/hypr/hyprland.conf
 
-    # Sync current Omarchy defaults into ~/.config
+    # Sync current Omarchy defaults into local files
     stomarchy sync
 
     # View status
     stomarchy status
 
 DIRECTORY STRUCTURE:
-    Diff-only snippets are tracked under ~/.config/stomarchy/ with
-    the same structure as ~/.config:
+    Diff-only tweaks are tracked under ~/.config/stomarchy/:
 
     ~/.config/                      ~/.config/stomarchy/
     ├── hypr/                       ├── .config/
     │   ├── hyprland.conf           │   └── hypr/
     │   └── hyprland.lua            │       ├── hyprland.conf
     │                               │       └── hyprland.lua
+    ~/.bashrc                       ├── .bashrc
+    ~/.inputrc                      └── .inputrc
 
     Use git to version control your ~/.config/stomarchy/ directory.
 

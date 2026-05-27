@@ -31,10 +31,10 @@ When Omarchy ships changed defaults:
 # 1. Update Omarchy via your package manager
 sudo pacman -S omarchy  # or yay -S omarchy-git
 
-# 2. Copy current Omarchy defaults into ~/.config
+# 2. Copy current Omarchy defaults into local files
 stomarchy sync
 
-# This replaces Omarchy-managed config files and reattaches tracked imports
+# This replaces Omarchy-managed files and reattaches tracked imports
 ```
 
 ## Practical Examples
@@ -62,7 +62,7 @@ bind = SUPER SHIFT, S, exec, grim
 stomarchy add ~/.config/hypr/hyprland.conf
 ```
 
-The tracked snippet contains only your new runtime lines:
+The tweak contains only your new runtime lines:
 
 ```conf
 bind = SUPER, B, exec, firefox
@@ -80,7 +80,7 @@ source = /home/user/.config/stomarchy/.config/hypr/hyprland.conf
 # END Stomarchy customizations
 ```
 
-When you replace an existing Hyprland binding, Stomarchy adds an `unbind` line before your replacement in the snippet.
+When you replace an existing Hyprland binding, Stomarchy adds an `unbind` line before your replacement in the tweak.
 
 ### Example 2: Hyprland Lua Configs
 
@@ -100,7 +100,7 @@ dofile("/home/user/.config/stomarchy/.config/hypr/hyprland.lua")
 -- END Stomarchy customizations
 ```
 
-If you replace `hl.bind("KEYS", ...)`, the snippet includes `hl.unbind("KEYS")` before the replacement. Edits inside existing Lua tables/functions are skipped with a warning because they are not safe standalone snippets.
+If you replace `hl.bind("KEYS", ...)`, the tweak includes `hl.unbind("KEYS")` before the replacement. Edits inside existing Lua tables/functions are skipped with a warning because they are not safe standalone tweaks.
 
 ### Example 3: Tracking Multiple Files
 
@@ -110,27 +110,48 @@ stomarchy add ~/.config/hypr/hyprland.conf
 stomarchy add ~/.config/hypr/hyprland.lua
 stomarchy add ~/.config/kitty/kitty.conf
 stomarchy add ~/.config/ghostty/config
+stomarchy add ~/.bashrc
+stomarchy add ~/.inputrc
 
 # Check what's being tracked
 stomarchy status
 
-# Wire all checked-out snippets into ~/.config
+# Wire all checked-out tweaks into local files
 stomarchy link
 
 # Stop tracking one file and restore Omarchy's default
 stomarchy remove ~/.config/hypr/hyprland.conf
 ```
 
-Waybar JSONC/CSS, Alacritty TOML, YAML, XML, desktop files, binaries, and files outside `~/.config` are intentionally unsupported until they have reliable runtime import behavior.
+Waybar JSONC/CSS, Alacritty TOML, YAML, XML, desktop files, binaries, and files outside `~/.config`, `~/.bashrc`, or `~/.inputrc` are intentionally unsupported until they have reliable runtime import behavior.
 
-### Example 4: Using Git for Version Control
+### Example 4: Bash And Inputrc
+
+```bash
+# Track Bash startup changes
+stomarchy add ~/.bashrc
+
+# Track Readline input settings
+stomarchy add ~/.inputrc
+```
+
+The tweaks live at:
+
+```text
+~/.config/stomarchy/.bashrc
+~/.config/stomarchy/.inputrc
+```
+
+`~/.bashrc` uses `source "/home/user/.config/stomarchy/.bashrc"`. `~/.inputrc` uses `$include /home/user/.config/stomarchy/.inputrc`.
+
+### Example 5: Using Git for Version Control
 
 ```bash
 # Initialize git in your stomarchy directory
 cd ~/.config/stomarchy
 git init
 
-# Add all tracked files
+# Add all tweaks
 git add .
 
 # Commit your changes
@@ -141,7 +162,7 @@ git remote add origin git@github.com:username/my-omarchy-config.git
 git push -u origin main
 ```
 
-### Example 5: Fresh Install Workflow
+### Example 6: Fresh Install Workflow
 
 On a new machine or after fresh install:
 
@@ -155,28 +176,29 @@ sudo pacman -S stomarchy
 # 3. Clone your stomarchy config from git
 git clone git@github.com:username/my-omarchy-config.git ~/.config/stomarchy
 
-# 4. Wire checked-out snippets into Omarchy
+# 4. Wire checked-out tweaks into Omarchy
 stomarchy link
 
 # Your custom configs are now integrated!
 ```
 
-### Example 6: Linking Checked-Out Snippets
+### Example 7: Linking Checked-Out Tweaks
 
 ```bash
 # After cloning ~/.config/stomarchy from git
 stomarchy link
 
-# Or link just one checked-out snippet by target path
+# Or link just one checked-out tweak by target path
 stomarchy link ~/.config/hypr/bindings.conf
 
-# You can also point directly at the checked-out tracked snippet
+# You can also point directly at the checked-out tweak
 stomarchy link ~/.config/stomarchy/.config/hypr/bindings.conf
+stomarchy link ~/.config/stomarchy/.bashrc
 ```
 
-`link` restores each target from the current Omarchy base config and adds the import block for the checked-out snippet. It does not recalculate snippets from edited `~/.config` files.
+`link` restores each target from the current Omarchy base config and adds the import block for the checked-out tweak. It does not recalculate tweaks from edited local files.
 
-### Example 7: Checking Status
+### Example 8: Checking Status
 
 ```bash
 stomarchy status
@@ -184,30 +206,32 @@ stomarchy status
 # Output shows:
 # - Stomarchy directory location
 # - Omarchy defaults location
-# - List of all tracked files
+# - List of all tweaks
 ```
 
-### Example 8: Removing a Customization
+### Example 9: Removing a Customization
 
 ```bash
-# Remove a tracked snippet and restore the Omarchy base config
+# Remove a tweak and restore the Omarchy base config
 stomarchy remove ~/.config/hypr/bindings.conf
 ```
 
 This deletes `~/.config/stomarchy/.config/hypr/bindings.conf`, backs up the current `~/.config/hypr/bindings.conf`, and replaces it with `~/.local/share/omarchy/config/hypr/bindings.conf`.
+
+For home dotfiles, `stomarchy remove ~/.bashrc` deletes `~/.config/stomarchy/.bashrc` and restores `~/.bashrc` from `~/.local/share/omarchy/config/.bashrc`.
 
 ## Advanced Usage
 
 ### Syncing with Omarchy Updates
 
 ```bash
-# Copy current Omarchy defaults into ~/.config
+# Copy current Omarchy defaults into local files
 stomarchy sync
 
 # This will:
-# - Copy files from ~/.local/share/omarchy/config/ into ~/.config/
+# - Copy files from ~/.local/share/omarchy/config/ into their matching local targets
 # - Back up changed target files
-# - Reattach import blocks for tracked Stomarchy snippets
+# - Reattach import blocks for Stomarchy tweaks
 ```
 
 ### Directory Structure
@@ -222,13 +246,15 @@ After tracking some files:
 │   │   └── hyprland.lua
 │   └── kitty/
 │       └── kitty.conf
+├── .bashrc
+└── .inputrc
 ```
 
 ## Tips and Best Practices
 
 1. **Use Git**: Version control your `~/.config/stomarchy/` directory with git
 2. **Use Sync**: Run `stomarchy sync` after Omarchy updates to get the current defaults
-3. **Use Link After Clone**: Run `stomarchy link` after checking out your tracked snippets from git
+3. **Use Link After Clone**: Run `stomarchy link` after checking out your tweaks from git
 4. **Track Selectively**: Only track files you've actually customized
 5. **Check Status**: Use `stomarchy status` to see what's being tracked
 6. **After Omarchy Update**: Run `stomarchy sync` after updating Omarchy
@@ -243,9 +269,9 @@ After tracking some files:
 
 ### Custom configs not working
 - Verify source directive was added: `grep -r "stomarchy" ~/.config/`
-- Check tracked file exists: `stomarchy status`
+- Check the tweak exists: `stomarchy status`
 - Ensure the application supports the import directive Stomarchy uses
-- For Lua, remember Stomarchy uses `dofile()` with an absolute tracked snippet path
+- For Lua, remember Stomarchy uses `dofile()` with an absolute tweak path
 
 ### Repeated add behavior
 - Stomarchy restores the Omarchy original and writes a marked import block
