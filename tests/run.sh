@@ -16,14 +16,14 @@ assert_file_contains() {
     local file="$1"
     local expected="$2"
 
-    grep -Fq "$expected" "$file" || fail "Expected ${file} to contain: ${expected}"
+    grep -Fq -- "$expected" "$file" || fail "Expected ${file} to contain: ${expected}"
 }
 
 assert_file_not_contains() {
     local file="$1"
     local unexpected="$2"
 
-    if grep -Fq "$unexpected" "$file"; then
+    if grep -Fq -- "$unexpected" "$file"; then
         fail "Expected ${file} not to contain: ${unexpected}"
     fi
 }
@@ -45,6 +45,10 @@ assert_empty_file() {
 
     assert_file_exists "$file"
     [ ! -s "$file" ] || fail "Expected file to be empty: $file"
+}
+
+assert_no_backup_files() {
+    [ -z "$(find "$HOME" -name '*.stomarchy-backup.*' -print -quit)" ] || fail "Expected no backup files"
 }
 
 with_temp_home() {
@@ -212,10 +216,10 @@ test_add_restores_original_and_is_idempotent() {
     assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
     assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
 
-    compgen -G "${target}.stomarchy-backup.*" > /dev/null || fail "Expected add to create a backup"
+    assert_no_backup_files
 
     "$SCRIPT" add "$target" > add-two.log
-    [ "$(grep -c "BEGIN Stomarchy customizations" "$target")" -eq 1 ] || fail "Expected one Stomarchy block after repeated add"
+    [ "$(grep -c "BEGIN Stomarchy tweaks" "$target")" -eq 1 ] || fail "Expected one Stomarchy block after repeated add"
     assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
 
     {
@@ -227,6 +231,47 @@ test_add_restores_original_and_is_idempotent() {
     assert_file_contains "$target" "bind = SUPER, B, exec, zen-browser"
     assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
     assert_file_not_contains "$tweak" "zen-browser"
+}
+
+test_add_dry_run_previews_tweak_without_writing() {
+    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
+
+    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
+    {
+        echo "bind = SUPER, Q, killactive"
+        echo "workspace = 1, monitor:DP-3"
+    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
+
+    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
+    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
+
+    "$SCRIPT" add --dry-run "$target" > add.log
+
+    assert_file_not_exists "$tweak"
+    assert_file_contains "$target" "workspace = 1, monitor:DP-3"
+    assert_file_not_contains "$target" "BEGIN Stomarchy tweaks"
+    assert_file_contains add.log "Dry run: no files changed"
+    assert_file_contains add.log "workspace = 1, monitor:DP-3"
+}
+
+test_legacy_customization_blocks_become_tweak_blocks() {
+    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr"
+
+    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
+    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
+
+    {
+        echo "bind = SUPER, Q, killactive"
+        echo ""
+        echo "# BEGIN Stomarchy customizations"
+        echo "source = ${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
+        echo "# END Stomarchy customizations"
+    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
+
+    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/bindings.conf" > add.log
+
+    assert_file_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "BEGIN Stomarchy tweaks"
+    assert_file_not_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "BEGIN Stomarchy customizations"
 }
 
 test_lua_add_uses_tracked_tweak_path() {
@@ -244,6 +289,8 @@ test_lua_add_uses_tracked_tweak_path() {
     "$SCRIPT" add "$target" > add.log
 
     assert_file_contains "$target" "dofile(\"${tweak}\")"
+    assert_file_contains "$target" "BEGIN Stomarchy tweaks"
+    assert_file_not_contains "$target" "BEGIN Stomarchy customizations"
     assert_file_not_contains "$target" "_stomarchy"
 }
 
@@ -313,7 +360,7 @@ test_link_checked_out_tweaks() {
     assert_file_contains "$ghostty_target" "font-size = 9"
     assert_file_contains "$ghostty_target" "config-file = \"${ghostty_tweak}\""
     assert_file_contains "$ghostty_tweak" "font-size = 11"
-    compgen -G "${ghostty_target}.stomarchy-backup.*" > /dev/null || fail "Expected link to back up stale target"
+    assert_no_backup_files
     assert_file_contains link.log "Linked 2 tweak"
 }
 
@@ -383,12 +430,45 @@ test_link_missing_tweak_fails() {
     assert_file_contains err.log "Tweak not found"
 }
 
+test_status_reports_tweak_health() {
+    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/waybar"
+
+    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
+    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
+    echo "bind = SUPER, Return, exec, kitty" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/empty.conf"
+    : > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/empty.conf"
+    echo "workspace = 9" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/old.conf"
+    echo '{"position": "top"}' > "${XDG_CONFIG_HOME}/stomarchy/.config/waybar/config.jsonc"
+
+    "$SCRIPT" link "${XDG_CONFIG_HOME}/hypr/bindings.conf" > link.log
+    "$SCRIPT" status > status.log
+
+    assert_file_contains status.log "~/.config/hypr/bindings.conf [linked]"
+    assert_file_contains status.log "~/.config/hypr/empty.conf [no-op, unlinked, stale]"
+    assert_file_contains status.log "~/.config/hypr/old.conf [missing-original, unlinked]"
+    assert_file_contains status.log "~/.config/waybar/config.jsonc [unsupported, missing-original, unlinked]"
+}
+
 test_apply_command_removed() {
     if "$SCRIPT" apply > out.log 2> err.log; then
         fail "apply command unexpectedly succeeded"
     fi
 
     assert_file_contains err.log "Unknown command: apply"
+}
+
+test_removed_commands_are_unknown() {
+    if "$SCRIPT" bootstrap > out.log 2> err.log; then
+        fail "bootstrap command unexpectedly succeeded"
+    fi
+
+    assert_file_contains err.log "Unknown command: bootstrap"
+
+    if "$SCRIPT" completion bash > out.log 2> err.log; then
+        fail "completion command unexpectedly succeeded"
+    fi
+
+    assert_file_contains err.log "Unknown command: completion"
 }
 
 test_remove_restores_default_and_deletes_tweak() {
@@ -418,7 +498,7 @@ test_remove_restores_default_and_deletes_tweak() {
     assert_file_contains "$target" "bind = SUPER, B, exec, brave"
     assert_file_not_contains "$target" "source = ${tweak}"
     assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
-    compgen -G "${target}.stomarchy-backup.*" > /dev/null || fail "Expected remove to create a backup"
+    assert_no_backup_files
 }
 
 test_remove_untracked_missing_target_restores_default() {
@@ -483,8 +563,26 @@ test_sync_copies_local_defaults_and_reapplies_imports() {
     assert_file_contains "$waybar_target" '{"position": "top"}'
     assert_file_not_contains "$waybar_target" '{"position": "bottom"}'
     assert_file_contains "$ghostty_target" "font-size = 9"
-    compgen -G "${waybar_target}.stomarchy-backup.*" > /dev/null || fail "Expected sync to back up changed untracked config"
+    assert_no_backup_files
     assert_file_contains sync.log "applied 1 import block"
+}
+
+test_sync_dry_run_shows_diff_without_writing() {
+    mkdir -p "${XDG_CONFIG_HOME}/waybar" "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar"
+
+    echo '{"position": "bottom"}' > "${XDG_CONFIG_HOME}/waybar/config.jsonc"
+    echo '{"position": "top"}' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar/config.jsonc"
+
+    local target="${XDG_CONFIG_HOME}/waybar/config.jsonc"
+
+    "$SCRIPT" sync --dry-run > sync.log
+
+    assert_file_contains "$target" '{"position": "bottom"}'
+    assert_file_contains sync.log "Would update: ~/.config/waybar/config.jsonc"
+    assert_file_contains sync.log '-{"position": "bottom"}'
+    assert_file_contains sync.log '+{"position": "top"}'
+    assert_file_contains sync.log "Would sync 1 file"
+    assert_no_backup_files
 }
 
 test_sync_missing_omarchy_config_dir_fails() {
@@ -507,6 +605,84 @@ test_sync_warns_for_tracked_file_without_original() {
     assert_file_contains out.log "Tweak has no current Omarchy original"
 }
 
+test_wipe_restores_baselines_without_deleting_tweaks() {
+    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
+
+    {
+        echo "bind = SUPER, Q, killactive"
+        echo "bind = SUPER, B, exec, brave"
+    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
+
+    {
+        echo "bind = SUPER, Q, killactive"
+        echo "bind = SUPER, B, exec, firefox"
+        echo "workspace = 1, monitor:DP-3"
+    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
+
+    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
+    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
+
+    "$SCRIPT" add "$target" > add.log
+    "$SCRIPT" wipe > wipe.log
+
+    assert_file_contains "$target" "bind = SUPER, B, exec, brave"
+    assert_file_not_contains "$target" "BEGIN Stomarchy tweaks"
+    assert_file_not_contains "$target" "source = ${tweak}"
+    assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
+    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
+    assert_no_backup_files
+    assert_file_contains wipe.log "Wiped"
+}
+
+test_wipe_restores_home_dotfiles() {
+    echo "alias ll='ls -la'" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.bashrc"
+    echo "set editing-mode vi" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.inputrc"
+
+    {
+        echo "alias ll='ls -la'"
+        echo "export EDITOR=vim"
+    } > "${HOME}/.bashrc"
+
+    {
+        echo "set editing-mode vi"
+        echo "set completion-ignore-case on"
+    } > "${HOME}/.inputrc"
+
+    "$SCRIPT" add "${HOME}/.bashrc" > bashrc-add.log
+    "$SCRIPT" add "${HOME}/.inputrc" > inputrc-add.log
+    "$SCRIPT" wipe > wipe.log
+
+    assert_file_contains "${HOME}/.bashrc" "alias ll='ls -la'"
+    assert_file_not_contains "${HOME}/.bashrc" "source \"${XDG_CONFIG_HOME}/stomarchy/.bashrc\""
+    assert_file_not_contains "${HOME}/.bashrc" "export EDITOR=vim"
+    assert_file_contains "${HOME}/.inputrc" "set editing-mode vi"
+    assert_file_not_contains "${HOME}/.inputrc" "\$include ${XDG_CONFIG_HOME}/stomarchy/.inputrc"
+    assert_file_not_contains "${HOME}/.inputrc" "set completion-ignore-case on"
+    assert_file_exists "${XDG_CONFIG_HOME}/stomarchy/.bashrc"
+    assert_file_exists "${XDG_CONFIG_HOME}/stomarchy/.inputrc"
+}
+
+test_wipe_missing_omarchy_config_dir_fails() {
+    rm -rf "$STOMARCHY_OMARCHY_CONFIG_DIR"
+
+    if "$SCRIPT" wipe > out.log 2> err.log; then
+        fail "wipe succeeded without Omarchy config directory"
+    fi
+
+    assert_file_contains err.log "Omarchy config directory not found"
+}
+
+test_completion_and_man_assets() {
+    assert_file_contains "${ROOT_DIR}/completions/stomarchy.bash" "complete -F _stomarchy stomarchy"
+    assert_file_contains "${ROOT_DIR}/completions/stomarchy.bash" "wipe"
+    assert_file_not_contains "${ROOT_DIR}/completions/stomarchy.bash" "bootstrap"
+    assert_file_not_contains "${ROOT_DIR}/completions/stomarchy.bash" "completion"
+    assert_file_contains "${ROOT_DIR}/man/stomarchy.1" "wipe"
+    assert_file_not_contains "${ROOT_DIR}/man/stomarchy.1" "bootstrap"
+    assert_file_not_contains "${ROOT_DIR}/man/stomarchy.1" "completion"
+}
+
+
 with_temp_home "rejects unsupported outside paths" test_rejects_unsupported_outside_paths
 with_temp_home "rejects missing Omarchy original" test_rejects_missing_original
 with_temp_home "Hyprland conf tweaks include unbinds" test_hypr_conf_tweak
@@ -515,6 +691,8 @@ with_temp_home "Hyprland Lua bind replacements" test_hypr_lua_bind_replacement
 with_temp_home "Hyprland Lua partial table edits are skipped" test_hypr_lua_partial_table_skip
 with_temp_home "unsupported Waybar JSONC fails" test_unsupported_waybar_fails
 with_temp_home "add restores originals and is idempotent" test_add_restores_original_and_is_idempotent
+with_temp_home "add dry-run previews tweak without writing" test_add_dry_run_previews_tweak_without_writing
+with_temp_home "legacy customization blocks become tweak blocks" test_legacy_customization_blocks_become_tweak_blocks
 with_temp_home "Lua add uses tweak path" test_lua_add_uses_tracked_tweak_path
 with_temp_home "bashrc add tracks home dotfile" test_bashrc_add_tracks_home_dotfile
 with_temp_home "inputrc add tracks home dotfile" test_inputrc_add_tracks_home_dotfile
@@ -524,13 +702,20 @@ with_temp_home "link single tweak file" test_link_single_tracked_file
 with_temp_home "link home dotfiles" test_link_home_dotfiles
 with_temp_home "link ignores git checkout files" test_link_ignores_git_checkout_files
 with_temp_home "link missing tweak fails" test_link_missing_tweak_fails
+with_temp_home "status reports tweak health" test_status_reports_tweak_health
 with_temp_home "apply command is removed" test_apply_command_removed
+with_temp_home "removed commands are unknown" test_removed_commands_are_unknown
 with_temp_home "remove restores default and deletes tweak" test_remove_restores_default_and_deletes_tweak
 with_temp_home "remove untracked missing target restores default" test_remove_untracked_missing_target_restores_default
 with_temp_home "remove missing original fails" test_remove_missing_original_fails
 with_temp_home "sync copies local defaults and reapplies imports" test_sync_copies_local_defaults_and_reapplies_imports
+with_temp_home "sync dry-run shows diff without writing" test_sync_dry_run_shows_diff_without_writing
 with_temp_home "sync fails without Omarchy config directory" test_sync_missing_omarchy_config_dir_fails
 with_temp_home "sync warns for tweak without original" test_sync_warns_for_tracked_file_without_original
+with_temp_home "wipe restores baselines without deleting tweaks" test_wipe_restores_baselines_without_deleting_tweaks
+with_temp_home "wipe restores home dotfiles" test_wipe_restores_home_dotfiles
+with_temp_home "wipe fails without Omarchy config directory" test_wipe_missing_omarchy_config_dir_fails
+with_temp_home "completion and man assets" test_completion_and_man_assets
 
 echo "${PASS_COUNT} passed, ${FAIL_COUNT} failed"
 

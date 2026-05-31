@@ -1,0 +1,72 @@
+.TH STOMARCHY 1 "May 2026" "stomarchy 0.1.0" "User Commands"
+.SH NAME
+stomarchy \- manage Omarchy config tweaks without replacing the defaults
+.SH SYNOPSIS
+.B stomarchy
+.RI COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B stomarchy
+stores user changes as diff-only runtime tweaks under
+.IR ~/.config/stomarchy
+and imports those tweaks from config files restored from Omarchy defaults.
+.SH COMMANDS
+.TP
+.B add [--dry-run] FILE
+Generate a tweak from FILE by comparing it with the matching Omarchy original.
+Without
+.BR --dry-run ,
+the target file is restored from the Omarchy original and a Stomarchy tweak
+import block is appended.
+.TP
+.B link [FILE]
+Link checked-out tweaks into local target files without recalculating them.
+.TP
+.B remove FILE
+Delete the matching tweak and restore FILE from the Omarchy original.
+.TP
+.B sync [--dry-run]
+Copy current Omarchy originals into local target files and reattach tweak import
+blocks.
+With
+.BR --dry-run ,
+print the changes that would be made without writing files.
+.TP
+.B wipe
+Restore every local target with a current Omarchy original back to the baseline
+Omarchy file, without appending tweak imports. Tracked tweaks are left intact.
+.TP
+.B status
+Show tweak health, including linked, unlinked, stale, no-op, unsupported, and
+missing-original states.
+.SH FILES
+.TP
+.I ~/.config/stomarchy
+Directory containing tracked tweaks.
+.TP
+.I ~/.local/share/omarchy/config
+Default Omarchy config mirror used as the comparison and restore source.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME
+Overrides the user's config directory. Defaults to
+.IR ~/.config .
+.TP
+.B STOMARCHY_OMARCHY_CONFIG_DIR
+Overrides the Omarchy original config directory.
+.SH EXAMPLES
+.TP
+Preview a tweak:
+.B stomarchy add --dry-run ~/.config/hypr/hyprland.conf
+.TP
+Track and wire a tweak:
+.B stomarchy add ~/.config/hypr/hyprland.conf
+.TP
+Preview an Omarchy sync:
+.B stomarchy sync --dry-run
+.TP
+Return local targets to Omarchy baselines:
+.B stomarchy wipe
+.SH SEE ALSO
+.BR bash (1),
+.BR diff (1)

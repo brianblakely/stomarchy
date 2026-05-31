@@ -9,6 +9,7 @@
 #   link      - Link tweaks into local target files
 #   remove    - Stop tracking a file and restore Omarchy defaults
 #   sync      - Sync current local Omarchy defaults into local target files
+#   wipe      - Restore local targets to baseline Omarchy configs
 #   status    - Show current status of tweaks
 #   help      - Show this help message
 #
@@ -186,6 +187,17 @@ is_supported_config() {
     esac
 }
 
+append_tag() {
+    local current="$1"
+    local tag="$2"
+
+    if [ -z "$current" ]; then
+        echo "$tag"
+    else
+        echo "${current}, ${tag}"
+    fi
+}
+
 escape_double_quoted() {
     printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
@@ -246,18 +258,18 @@ strip_stomarchy_blocks() {
     local output_file="$2"
 
     awk -v stomarchy_dir="$STOMARCHY_DIR" '
-        /BEGIN Stomarchy customizations/ {
+        /BEGIN Stomarchy (customizations|tweaks)/ {
             in_block = 1
             next
         }
-        /END Stomarchy customizations/ {
+        /END Stomarchy (customizations|tweaks)/ {
             in_block = 0
             next
         }
         in_block {
             next
         }
-        /Stomarchy customizations/ {
+        /Stomarchy (customizations|tweaks)/ {
             legacy_block = 1
             next
         }
@@ -276,6 +288,12 @@ strip_stomarchy_blocks() {
             print
         }
     ' "$input_file" > "$output_file"
+}
+
+has_stomarchy_block() {
+    local input_file="$1"
+
+    grep -Eq "BEGIN Stomarchy (customizations|tweaks)|Stomarchy (customizations|tweaks)" "$input_file"
 }
 
 write_added_lines() {
@@ -549,10 +567,44 @@ append_import_block() {
 
     {
         echo ""
-        echo "${comment_prefix} BEGIN Stomarchy customizations"
+        echo "${comment_prefix} BEGIN Stomarchy tweaks"
         echo "$import_directive"
-        echo "${comment_prefix} END Stomarchy customizations"
+        echo "${comment_prefix} END Stomarchy tweaks"
     } >> "$output_file"
+}
+
+show_file_diff() {
+    local current_file="$1"
+    local desired_file="$2"
+    local current_label="$3"
+    local desired_label="$4"
+
+    if [ -f "$current_file" ]; then
+        diff -u --label "$current_label" --label "$desired_label" "$current_file" "$desired_file" || true
+    else
+        diff -u --label "$current_label" --label "$desired_label" /dev/null "$desired_file" || true
+    fi
+}
+
+print_tweak_preview() {
+    local tweak_file="$1"
+    local tweak_path="$2"
+    local target_file="$3"
+    local original_file="$4"
+    local import_directive="$5"
+
+    log_info "Dry run: no files changed"
+    log_info "Would write tweak: $tweak_path"
+    echo "--- tweak: ${tweak_path} ---"
+    if [ -s "$tweak_file" ]; then
+        cat "$tweak_file"
+    else
+        echo "(empty no-op tweak)"
+    fi
+    echo "--- end tweak ---"
+    log_info "Would restore target from: $original_file"
+    log_info "Would add import block to: $target_file"
+    echo "$import_directive"
 }
 
 restore_target_with_import() {
@@ -578,12 +630,6 @@ restore_target_with_import() {
 
     mkdir -p "$(dirname "$target_file")"
 
-    if [ -f "$target_file" ]; then
-        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
-        cp -p "$target_file" "$backup_file"
-        log_info "Backed up current config to: $backup_file"
-    fi
-
     cp -p "$desired_file" "$target_file"
     rm -f "$desired_file"
 
@@ -604,12 +650,6 @@ restore_target_base() {
 
     mkdir -p "$(dirname "$target_file")"
 
-    if [ -f "$target_file" ]; then
-        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
-        cp -p "$target_file" "$backup_file"
-        log_info "Backed up current config to: $backup_file"
-    fi
-
     cp -p "$original_file" "$target_file"
     log_info "Restored Omarchy default to: $target_file"
 }
@@ -617,6 +657,7 @@ restore_target_base() {
 write_synced_target() {
     local config_rel_path="$1"
     local original_file="$2"
+    local dry_run="${3:-false}"
     local target_file
     local tracked_file
     local desired_file
@@ -647,13 +688,25 @@ write_synced_target() {
         return 0
     fi
 
-    mkdir -p "$(dirname "$target_file")"
+    if [ "$dry_run" = true ]; then
+        if [ -f "$target_file" ]; then
+            log_info "Would update: $(format_target_label "$config_rel_path")"
+            show_file_diff "$target_file" "$desired_file" "$target_file (current)" "$target_file (after sync)"
+        else
+            log_info "Would create: $(format_target_label "$config_rel_path")"
+            show_file_diff "$target_file" "$desired_file" "/dev/null" "$target_file (after sync)"
+        fi
 
-    if [ -f "$target_file" ]; then
-        local backup_file="${target_file}.stomarchy-backup.$(date +%s%N)"
-        cp -p "$target_file" "$backup_file"
-        log_info "Backed up current config to: $backup_file"
+        rm -f "$desired_file"
+        if [ "$import_applied" = true ]; then
+            SYNC_RESULT="would_sync_import"
+        else
+            SYNC_RESULT="would_sync"
+        fi
+        return 0
     fi
+
+    mkdir -p "$(dirname "$target_file")"
 
     cp -p "$desired_file" "$target_file"
     rm -f "$desired_file"
@@ -667,8 +720,31 @@ write_synced_target() {
 
 # Track a tweak and update the target file
 cmd_add() {
-    if [ -z "$1" ]; then
-        log_error "Usage: stomarchy add <file>"
+    local dry_run=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run|--preview|-n)
+                dry_run=true
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                log_error "Unknown add option: $1"
+                log_info "Usage: stomarchy add [--dry-run] <file>"
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ -z "${1:-}" ]; then
+        log_error "Usage: stomarchy add [--dry-run] <file>"
         exit 1
     fi
     
@@ -679,7 +755,9 @@ cmd_add() {
         exit 1
     fi
 
-    init_dirs
+    if [ "$dry_run" = false ]; then
+        init_dirs
+    fi
 
     local config_rel_path
     config_rel_path=$(get_config_rel_path "$source_file")
@@ -702,27 +780,48 @@ cmd_add() {
     local stomarchy_path
     stomarchy_path=$(get_stomarchy_path "$config_rel_path")
 
-    # Create directory structure
-    mkdir -p "$(dirname "$stomarchy_path")"
-
     local cleaned_source
     local source_is_managed=false
+    local generated_tweak
+    local should_write_tweak=false
     cleaned_source=$(mktemp)
+    generated_tweak=$(mktemp)
     strip_stomarchy_blocks "$source_file" "$cleaned_source"
 
-    if [ -f "$stomarchy_path" ] && grep -Eq "BEGIN Stomarchy customizations|Stomarchy customizations" "$source_file"; then
+    if [ -f "$stomarchy_path" ] && has_stomarchy_block "$source_file"; then
         source_is_managed=true
     fi
 
     if [ "$source_is_managed" = true ]; then
         log_info "Managed target detected; keeping existing tweak"
+        cp "$stomarchy_path" "$generated_tweak"
     elif [ -f "$stomarchy_path" ] && diff -q "$original_file" "$cleaned_source" > /dev/null; then
         log_info "Target is already restored; keeping existing tweak"
+        cp "$stomarchy_path" "$generated_tweak"
     else
-        generate_tweak "$original_file" "$cleaned_source" "$config_rel_path" "$stomarchy_path"
+        generate_tweak "$original_file" "$cleaned_source" "$config_rel_path" "$generated_tweak"
+        should_write_tweak=true
     fi
 
     rm -f "$cleaned_source"
+
+    if [ "$dry_run" = true ]; then
+        print_tweak_preview \
+            "$generated_tweak" \
+            "$stomarchy_path" \
+            "$(get_target_path "$config_rel_path")" \
+            "$original_file" \
+            "$(get_import_directive "$config_rel_path" "$stomarchy_path")"
+        rm -f "$generated_tweak"
+        return 0
+    fi
+
+    if [ "$should_write_tweak" = true ]; then
+        mkdir -p "$(dirname "$stomarchy_path")"
+        cp "$generated_tweak" "$stomarchy_path"
+    fi
+
+    rm -f "$generated_tweak"
 
     restore_target_with_import "$config_rel_path" "$stomarchy_path" "$original_file"
 
@@ -849,7 +948,36 @@ cmd_link() {
 
 # Sync user configs from the current local Omarchy defaults
 cmd_sync() {
-    log_info "Syncing local targets from current Omarchy defaults..."
+    local dry_run=false
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run|--preview|-n)
+                dry_run=true
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                log_error "Unknown sync option: $1"
+                log_info "Usage: stomarchy sync [--dry-run]"
+                exit 1
+                ;;
+            *)
+                log_error "Unexpected sync argument: $1"
+                log_info "Usage: stomarchy sync [--dry-run]"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$dry_run" = true ]; then
+        log_info "Previewing sync from current Omarchy defaults..."
+    else
+        log_info "Syncing local targets from current Omarchy defaults..."
+    fi
     init_dirs
 
     if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
@@ -865,13 +993,13 @@ cmd_sync() {
         local config_rel_path="${original_file#"$OMARCHY_CONFIG_DIR"/}"
 
         SYNC_RESULT=""
-        write_synced_target "$config_rel_path" "$original_file"
+        write_synced_target "$config_rel_path" "$original_file" "$dry_run"
 
         case "$SYNC_RESULT" in
-            synced)
+            synced|would_sync)
                 files_synced=$((files_synced + 1))
                 ;;
-            synced_import)
+            synced_import|would_sync_import)
                 files_synced=$((files_synced + 1))
                 imports_applied=$((imports_applied + 1))
                 ;;
@@ -903,7 +1031,46 @@ cmd_sync() {
         fi
     done < <(find_tracked_files)
 
-    log_success "Synced $files_synced file(s), left $files_unchanged unchanged, applied $imports_applied import block(s)"
+    if [ "$dry_run" = true ]; then
+        log_success "Would sync $files_synced file(s), leave $files_unchanged unchanged, apply $imports_applied import block(s)"
+    else
+        log_success "Synced $files_synced file(s), left $files_unchanged unchanged, applied $imports_applied import block(s)"
+    fi
+}
+
+# Restore all local targets to current Omarchy baselines without tweak imports
+cmd_wipe() {
+    if [ $# -gt 0 ]; then
+        log_error "Usage: stomarchy wipe"
+        exit 1
+    fi
+
+    log_info "Wiping Stomarchy imports from local targets..."
+
+    if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
+        log_error "Omarchy config directory not found: $OMARCHY_CONFIG_DIR"
+        exit 1
+    fi
+
+    local files_restored=0
+    local files_unchanged=0
+
+    while IFS= read -r -d '' original_file; do
+        local config_rel_path="${original_file#"$OMARCHY_CONFIG_DIR"/}"
+        local target_file
+        target_file=$(get_target_path "$config_rel_path")
+
+        if [ -f "$target_file" ] && cmp -s "$target_file" "$original_file"; then
+            files_unchanged=$((files_unchanged + 1))
+        else
+            files_restored=$((files_restored + 1))
+        fi
+
+        restore_target_base "$config_rel_path" "$original_file"
+    done < <(find "$OMARCHY_CONFIG_DIR" -type f -print0)
+
+    log_success "Wiped $files_restored file(s), left $files_unchanged unchanged"
+    log_info "Tweaks were left intact in: $STOMARCHY_DIR"
 }
 
 # Show status
@@ -934,6 +1101,7 @@ cmd_status() {
         local file_count=0
         while IFS= read -r -d '' tracked_file; do
             local filename
+            local status_tags=""
             filename=$(basename "$tracked_file")
             # Skip stomarchy internal files
             if [[ "$filename" == .stomarchy-* ]]; then
@@ -945,7 +1113,53 @@ cmd_status() {
                 continue
             fi
 
-            echo "  $(format_target_label "$config_rel_path")"
+            local target_file
+            local original_file
+            local supported=true
+            local original_present=true
+            local import_directive=""
+            target_file=$(get_target_path "$config_rel_path")
+            original_file=$(get_omarchy_original_path "$config_rel_path")
+
+            if ! is_supported_config "$config_rel_path"; then
+                supported=false
+                status_tags=$(append_tag "$status_tags" "unsupported")
+            fi
+
+            if [ ! -f "$original_file" ]; then
+                original_present=false
+                status_tags=$(append_tag "$status_tags" "missing-original")
+            fi
+
+            if [ ! -s "$tracked_file" ]; then
+                status_tags=$(append_tag "$status_tags" "no-op")
+            fi
+
+            if [ "$supported" = true ]; then
+                import_directive=$(get_import_directive "$config_rel_path" "$tracked_file" || true)
+            fi
+
+            if [ -n "$import_directive" ] && [ -f "$target_file" ] && grep -Fq -- "$import_directive" "$target_file"; then
+                status_tags=$(append_tag "$status_tags" "linked")
+            else
+                status_tags=$(append_tag "$status_tags" "unlinked")
+            fi
+
+            if [ "$supported" = true ] && [ "$original_present" = true ]; then
+                local desired_file
+                desired_file=$(mktemp)
+                cp -p "$original_file" "$desired_file"
+                append_import_block "$desired_file" "$config_rel_path" "$import_directive"
+
+                if [ ! -f "$target_file" ] || ! cmp -s "$target_file" "$desired_file"; then
+                    status_tags=$(append_tag "$status_tags" "stale")
+                fi
+
+                rm -f "$desired_file"
+            fi
+
+            echo "  $(format_target_label "$config_rel_path") [${status_tags}]"
+            echo "    Tweak: $tracked_file"
             file_count=$((file_count + 1))
         done < <(find_tracked_files)
         
@@ -970,15 +1184,18 @@ USAGE:
     stomarchy [COMMAND] [OPTIONS]
 
 COMMANDS:
-    add <file>          Track diff-only changes and update the local file
+    add [--dry-run] <file>
+                        Track diff-only changes and update the local file
     link [file]         Link checked-out tweaks into local files
     remove <file>       Stop tracking a file and restore Omarchy defaults
-    sync                Copy current Omarchy defaults into local files
+    sync [--dry-run]    Copy current Omarchy defaults into local files
+    wipe                Restore all local targets to Omarchy baselines
     status              Show current status and tweaks
     help                Show this help message
 
 EXAMPLES:
     # Track diff-only changes and update the local file
+    stomarchy add --dry-run ~/.config/hypr/hyprland.conf
     stomarchy add ~/.config/hypr/hyprland.conf
     stomarchy add ~/.bashrc
     stomarchy add ~/.inputrc
@@ -989,8 +1206,12 @@ EXAMPLES:
     # Stop tracking a file and restore the Omarchy default
     stomarchy remove ~/.config/hypr/hyprland.conf
 
-    # Sync current Omarchy defaults into local files
+    # Preview or sync current Omarchy defaults into local files
+    stomarchy sync --dry-run
     stomarchy sync
+
+    # Restore all local targets to Omarchy baselines
+    stomarchy wipe
 
     # View status
     stomarchy status
@@ -1034,7 +1255,12 @@ main() {
             cmd_remove "$@"
             ;;
         sync)
-            cmd_sync
+            shift
+            cmd_sync "$@"
+            ;;
+        wipe)
+            shift
+            cmd_wipe "$@"
             ;;
         status)
             cmd_status
