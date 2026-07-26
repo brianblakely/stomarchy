@@ -1,56 +1,53 @@
 #!/bin/bash
-#
-# Installation script for stomarchy
-#
 
-set -e
+set -euo pipefail
 
-INSTALL_DIR="/usr/local/bin"
-COMPLETION_DIR="/usr/local/share/bash-completion/completions"
-MAN_DIR="/usr/local/share/man/man1"
-SCRIPT_NAME="stomarchy"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
-# Check if running as root
-if [ "$EUID" -eq 0 ]; then
-    INSTALL_DIR="/usr/bin"
-    COMPLETION_DIR="/usr/share/bash-completion/completions"
-    MAN_DIR="/usr/share/man/man1"
+if (($# > 0)); then
+  case "$1" in
+    -h|--help)
+      cat <<'EOF'
+Usage: ./install.sh
+
+Install Stomarchy, its Bash completion, man page, and license.
+
+Environment:
+  PREFIX   Installation prefix. Defaults to ~/.local for non-root users and
+           /usr/local for root.
+  DESTDIR  Optional staging root prepended to every installed path.
+EOF
+      exit 0
+      ;;
+    *)
+      printf 'install.sh: unexpected argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
 fi
 
-echo "Installing stomarchy to ${INSTALL_DIR}..."
-
-# Create install directory if it doesn't exist
-mkdir -p "$INSTALL_DIR"
-
-# Copy the script
-cp stomarchy "${INSTALL_DIR}/${SCRIPT_NAME}"
-chmod +x "${INSTALL_DIR}/${SCRIPT_NAME}"
-
-if [ -f completions/stomarchy.bash ]; then
-    mkdir -p "$COMPLETION_DIR"
-    cp completions/stomarchy.bash "${COMPLETION_DIR}/stomarchy"
+if [[ -v PREFIX ]]; then
+  INSTALL_PREFIX=${PREFIX%/}
+elif ((EUID == 0)); then
+  INSTALL_PREFIX=/usr/local
+else
+  INSTALL_PREFIX="$HOME/.local"
 fi
 
-if [ -f man/stomarchy.1 ]; then
-    mkdir -p "$MAN_DIR"
-    cp man/stomarchy.1 "${MAN_DIR}/stomarchy.1"
+if [[ -z $INSTALL_PREFIX ]]; then
+  INSTALL_PREFIX=/
 fi
 
-echo "Installation complete!"
-echo ""
-echo "stomarchy has been installed to: ${INSTALL_DIR}/${SCRIPT_NAME}"
-echo "bash completion has been installed to: ${COMPLETION_DIR}/stomarchy"
-echo "man page has been installed to: ${MAN_DIR}/stomarchy.1"
-echo ""
-echo "Usage:"
-echo "  stomarchy help     - Show help message"
-echo "  stomarchy add      - Track changes and update local file"
-echo "  stomarchy add -n   - Preview tweak generation"
-echo "  stomarchy link     - Link checked-out tweaks"
-echo "  stomarchy remove   - Restore default and stop tracking"
-echo "  stomarchy sync     - Copy current Omarchy defaults"
-echo "  stomarchy sync -n  - Preview sync changes"
-echo "  stomarchy wipe     - Restore Omarchy baselines"
-echo "  stomarchy status   - Show current status"
-echo ""
-echo "Get started by running: stomarchy help"
+STAGE_ROOT=${DESTDIR:-}
+BIN_PATH="$STAGE_ROOT$INSTALL_PREFIX/bin/stomarchy"
+COMPLETION_PATH="$STAGE_ROOT$INSTALL_PREFIX/share/bash-completion/completions/stomarchy"
+MAN_PATH="$STAGE_ROOT$INSTALL_PREFIX/share/man/man1/stomarchy.1"
+LICENSE_PATH="$STAGE_ROOT$INSTALL_PREFIX/share/licenses/stomarchy/LICENSE"
+
+install -Dm755 "$SCRIPT_DIR/stomarchy" "$BIN_PATH"
+install -Dm644 "$SCRIPT_DIR/completions/stomarchy.bash" "$COMPLETION_PATH"
+install -Dm644 "$SCRIPT_DIR/man/stomarchy.1" "$MAN_PATH"
+install -Dm644 "$SCRIPT_DIR/LICENSE" "$LICENSE_PATH"
+
+printf 'Installed Stomarchy under %s\n' "$STAGE_ROOT$INSTALL_PREFIX"
+printf '  %s\n' "$BIN_PATH" "$COMPLETION_PATH" "$MAN_PATH" "$LICENSE_PATH"

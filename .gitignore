@@ -1,5 +1,7 @@
 # Build artifacts
 *.pkg.tar.zst
+stomarchy.1
+stomarchy.bash
 pkg/
 src/
 

@@ -1,1283 +1,2271 @@
 #!/bin/bash
 #
-# stomarchy - Save and restore your Omarchy config without disrupting its opinionated design
-#
-# Usage: stomarchy [command] [options]
-#
-# Commands:
-#   add       - Track a file with stomarchy
-#   link      - Link tweaks into local target files
-#   remove    - Stop tracking a file and restore Omarchy defaults
-#   sync      - Sync current local Omarchy defaults into local target files
-#   wipe      - Restore local targets to baseline Omarchy configs
-#   status    - Show current status of tweaks
-#   help      - Show this help message
-#
+# stomarchy - safely preserve additive Omarchy customizations
 
-set -e
+set -uo pipefail
 
-VERSION="0.1.0"
-CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-STOMARCHY_DIR="${CONFIG_HOME}/stomarchy"
-STOMARCHY_CONFIG_ROOT="${STOMARCHY_DIR}/.config"
-OMARCHY_CONFIG_DIR="${STOMARCHY_OMARCHY_CONFIG_DIR:-$HOME/.local/share/omarchy/config}"
+VERSION="0.2.0"
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+STORAGE_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+TARGET_CONFIG_HOME="$HOME/.config"
+STOMARCHY_DIR="$STORAGE_CONFIG_HOME/stomarchy"
+STOMARCHY_CONFIG_ROOT="$STOMARCHY_DIR/.config"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/stomarchy"
+BASELINE_DIR="$STATE_DIR/baselines"
 
-# Logging functions
+OMARCHY_ROOT=""
+OMARCHY_CONFIG_DIR=""
+
+TEMP_FILES=()
+LOCK_FD=""
+RECOVERY_DIR=""
+SNAPSHOTTED=()
+
+RED=""
+GREEN=""
+YELLOW=""
+BLUE=""
+NC=""
+
+if [[ -t 1 && -t 2 && ! -v NO_COLOR ]]; then
+  RED=$'\033[0;31m'
+  GREEN=$'\033[0;32m'
+  YELLOW=$'\033[1;33m'
+  BLUE=$'\033[0;34m'
+  NC=$'\033[0m'
+fi
+
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+  printf '%s[INFO]%s %s\n' "$BLUE" "$NC" "$*"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+  printf '%s[SUCCESS]%s %s\n' "$GREEN" "$NC" "$*"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+  printf '%s[WARN]%s %s\n' "$YELLOW" "$NC" "$*" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1" >&2
+  printf '%s[ERROR]%s %s\n' "$RED" "$NC" "$*" >&2
 }
 
-# Initialize directories
-init_dirs() {
-    mkdir -p "$STOMARCHY_DIR"
-}
+cleanup() {
+  local file
 
-# Convert a supported target file path to the matching Omarchy config path.
-get_config_rel_path() {
-    local file_path="$1"
-    local abs_path
-    local config_home_abs
-    local home_abs
-    local rel_path
-
-    abs_path=$(realpath -m "$file_path")
-    config_home_abs=$(realpath -m "$CONFIG_HOME")
-    home_abs=$(realpath -m "$HOME")
-    rel_path="${abs_path#"$config_home_abs"/}"
-
-    if [ "$rel_path" != "$abs_path" ]; then
-        echo "$rel_path"
-        return 0
+  for file in "${TEMP_FILES[@]}"; do
+    if [[ -n $file && -e $file ]]; then
+      rm -f -- "$file"
     fi
-
-    case "$abs_path" in
-        "$home_abs/.bashrc")
-            echo ".bashrc"
-            return 0
-            ;;
-        "$home_abs/.inputrc")
-            echo ".inputrc"
-            return 0
-            ;;
-    esac
-
-    log_error "File must be under config directory ($CONFIG_HOME) or be ~/.bashrc or ~/.inputrc"
-    exit 1
+  done
 }
 
-get_stomarchy_path() {
-    local config_rel_path="$1"
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-    case "$config_rel_path" in
-        .bashrc|.inputrc)
-            echo "${STOMARCHY_DIR}/${config_rel_path}"
-            ;;
-        *)
-            echo "${STOMARCHY_CONFIG_ROOT}/${config_rel_path}"
-            ;;
-    esac
+normalize_path() {
+  realpath -ms -- "$1"
 }
 
-get_omarchy_original_path() {
-    local config_rel_path="$1"
-    echo "${OMARCHY_CONFIG_DIR}/${config_rel_path}"
-}
+resolve_omarchy() {
+  local root=""
+  local config_override="${STOMARCHY_OMARCHY_CONFIG_DIR:-}"
 
-get_target_path() {
-    local config_rel_path="$1"
+  if [[ -n ${STOMARCHY_OMARCHY_ROOT:-} ]]; then
+    root=$STOMARCHY_OMARCHY_ROOT
+  elif [[ -n ${OMARCHY_PATH:-} ]]; then
+    root=$OMARCHY_PATH
+  elif [[ -d /usr/share/omarchy ]]; then
+    root=/usr/share/omarchy
+  else
+    root="$HOME/.local/share/omarchy"
+  fi
 
-    case "$config_rel_path" in
-        .bashrc|.inputrc)
-            echo "${HOME}/${config_rel_path}"
-            ;;
-        *)
-            echo "${CONFIG_HOME}/${config_rel_path}"
-            ;;
-    esac
-}
-
-get_config_rel_path_from_tracked() {
-    local tracked_file="$1"
-    local tracked_abs
-    local root_abs
-    local bashrc_abs
-    local inputrc_abs
-    local rel_path
-
-    tracked_abs=$(realpath -m "$tracked_file")
-    root_abs=$(realpath -m "$STOMARCHY_CONFIG_ROOT")
-    bashrc_abs=$(realpath -m "$STOMARCHY_DIR/.bashrc")
-    inputrc_abs=$(realpath -m "$STOMARCHY_DIR/.inputrc")
-    rel_path="${tracked_abs#"$root_abs"/}"
-
-    if [ "$rel_path" != "$tracked_abs" ]; then
-        echo "$rel_path"
-        return 0
+  if [[ -n $config_override ]]; then
+    OMARCHY_CONFIG_DIR=$(normalize_path "$config_override")
+    if [[ -z ${STOMARCHY_OMARCHY_ROOT:-} && -z ${OMARCHY_PATH:-} ]]; then
+      root=$(dirname -- "$OMARCHY_CONFIG_DIR")
     fi
+  fi
 
-    if [ "$tracked_abs" = "$bashrc_abs" ]; then
-        echo ".bashrc"
-        return 0
-    fi
+  OMARCHY_ROOT=$(normalize_path "$root")
 
-    if [ "$tracked_abs" = "$inputrc_abs" ]; then
-        echo ".inputrc"
-        return 0
-    fi
+  if [[ -z $config_override ]]; then
+    OMARCHY_CONFIG_DIR="$OMARCHY_ROOT/config"
+  fi
+}
 
+resolve_omarchy
+
+make_temp() {
+  local output_name=$1
+  local temp
+
+  temp=$(mktemp "${TMPDIR:-/tmp}/stomarchy.XXXXXX") || return 1
+  TEMP_FILES+=("$temp")
+  printf -v "$output_name" '%s' "$temp"
+}
+
+make_temp_beside() {
+  local output_name=$1
+  local destination=$2
+  local directory
+  local temp
+
+  directory=$(dirname -- "$destination")
+  mkdir -p -- "$directory" || return 1
+  temp=$(mktemp --tmpdir="$directory" ".stomarchy.tmp.XXXXXX") || return 1
+  TEMP_FILES+=("$temp")
+  printf -v "$output_name" '%s' "$temp"
+}
+
+atomic_replace() {
+  local staged_file=$1
+  local destination=$2
+
+  mv -fT -- "$staged_file" "$destination"
+}
+
+acquire_lock() {
+  local lock_path="$STATE_DIR/lock"
+  local baseline_probe
+
+  if [[ -L $STATE_DIR || ( -e $STATE_DIR && ! -d $STATE_DIR ) ]]; then
+    log_error "State path is not a safe directory: $STATE_DIR"
     return 1
-}
+  fi
 
-find_tracked_files() {
-    local tracked_dotfile
-
-    if [ -d "$STOMARCHY_CONFIG_ROOT" ]; then
-        find "$STOMARCHY_CONFIG_ROOT" -type f -print0
-    fi
-
-    for tracked_dotfile in "$STOMARCHY_DIR/.bashrc" "$STOMARCHY_DIR/.inputrc"; do
-        if [ -f "$tracked_dotfile" ]; then
-            printf '%s\0' "$tracked_dotfile"
-        fi
-    done
-}
-
-format_target_label() {
-    local config_rel_path="$1"
-
-    case "$config_rel_path" in
-        .bashrc|.inputrc)
-            echo "~/${config_rel_path}"
-            ;;
-        *)
-            echo "~/.config/${config_rel_path}"
-            ;;
-    esac
-}
-
-is_supported_config() {
-    local config_rel_path="$1"
-
-    case "$config_rel_path" in
-        hypr/*.conf|hypr/*.lua|kitty/*.conf|ghostty/config|foot/*.ini|tmux/*.conf|*.sh|.bashrc|.inputrc|uwsm/env|uwsm/default)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-append_tag() {
-    local current="$1"
-    local tag="$2"
-
-    if [ -z "$current" ]; then
-        echo "$tag"
-    else
-        echo "${current}, ${tag}"
-    fi
-}
-
-escape_double_quoted() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-get_comment_prefix() {
-    local config_rel_path="$1"
-
-    case "$config_rel_path" in
-        hypr/*.lua)
-            echo "--"
-            ;;
-        *)
-            echo "#"
-            ;;
-    esac
-}
-
-get_import_directive() {
-    local config_rel_path="$1"
-    local tracked_file="$2"
-    local tracked_abs
-
-    tracked_abs=$(realpath -m "$tracked_file")
-
-    case "$config_rel_path" in
-        hypr/*.conf)
-            echo "source = ${tracked_abs}"
-            ;;
-        hypr/*.lua)
-            echo "dofile(\"$(escape_double_quoted "$tracked_abs")\")"
-            ;;
-        kitty/*.conf)
-            echo "include ${tracked_abs}"
-            ;;
-        ghostty/config)
-            echo "config-file = \"$(escape_double_quoted "$tracked_abs")\""
-            ;;
-        foot/*.ini)
-            echo "include=${tracked_abs}"
-            ;;
-        tmux/*.conf)
-            echo "source-file \"$(escape_double_quoted "$tracked_abs")\""
-            ;;
-        .inputrc)
-            echo "\$include ${tracked_abs}"
-            ;;
-        *.sh|.bashrc|uwsm/env|uwsm/default)
-            echo "source \"$(escape_double_quoted "$tracked_abs")\""
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-strip_stomarchy_blocks() {
-    local input_file="$1"
-    local output_file="$2"
-
-    awk -v stomarchy_dir="$STOMARCHY_DIR" '
-        /BEGIN Stomarchy (customizations|tweaks)/ {
-            in_block = 1
-            next
-        }
-        /END Stomarchy (customizations|tweaks)/ {
-            in_block = 0
-            next
-        }
-        in_block {
-            next
-        }
-        /Stomarchy (customizations|tweaks)/ {
-            legacy_block = 1
-            next
-        }
-        legacy_block {
-            if ($0 == "") {
-                legacy_block = 0
-                print
-                next
-            }
-            if (index($0, "stomarchy") || index($0, stomarchy_dir)) {
-                next
-            }
-            legacy_block = 0
-        }
-        {
-            print
-        }
-    ' "$input_file" > "$output_file"
-}
-
-has_stomarchy_block() {
-    local input_file="$1"
-
-    grep -Eq "BEGIN Stomarchy (customizations|tweaks)|Stomarchy (customizations|tweaks)" "$input_file"
-}
-
-write_added_lines() {
-    local original_file="$1"
-    local user_file="$2"
-    local output_file="$3"
-
-    awk '
-        NR == FNR {
-            original[$0] = 1
-            next
-        }
-        !($0 in original) {
-            print
-        }
-    ' "$original_file" "$user_file" > "$output_file"
-}
-
-count_removed_lines() {
-    local original_file="$1"
-    local user_file="$2"
-
-    awk '
-        NR == FNR {
-            user[$0] = 1
-            next
-        }
-        !($0 in user) {
-            removed++
-        }
-        END {
-            print removed + 0
-        }
-    ' "$user_file" "$original_file"
-}
-
-trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
-}
-
-parse_hypr_bind() {
-    local line="$1"
-    local after_equals
-    local mods
-    local rest
-    local key
-
-    [[ "$line" =~ ^[[:space:]]*bind[^[:space:]=]*[[:space:]]*= ]] || return 1
-    [[ "$line" =~ ^[[:space:]]*unbind[[:space:]]*= ]] && return 1
-
-    after_equals="${line#*=}"
-    mods="${after_equals%%,*}"
-    rest="${after_equals#*,}"
-
-    [ "$rest" = "$after_equals" ] && return 1
-
-    key="${rest%%,*}"
-    mods=$(trim "$mods")
-    key=$(trim "$key")
-
-    [ -n "$mods" ] && [ -n "$key" ] || return 1
-    printf '%s\t%s\n' "$mods" "$key"
-}
-
-hypr_binding_exists() {
-    local original_file="$1"
-    local mods="$2"
-    local key="$3"
-
-    awk -v expected_mods="$mods" -v expected_key="$key" '
-        function trim_value(value) {
-            gsub(/^[ \t]+|[ \t]+$/, "", value)
-            return value
-        }
-        /^[ \t]*bind[^ \t=]*[ \t]*=/ {
-            if ($0 ~ /^[ \t]*unbind[ \t]*=/) {
-                next
-            }
-            line = $0
-            sub(/^[^=]*=/, "", line)
-            split(line, parts, ",")
-            if (trim_value(parts[1]) == expected_mods && trim_value(parts[2]) == expected_key) {
-                found = 1
-                exit
-            }
-        }
-        END {
-            exit found ? 0 : 1
-        }
-    ' "$original_file"
-}
-
-write_hypr_conf_tweak() {
-    local original_file="$1"
-    local added_lines_file="$2"
-    local output_file="$3"
-    local emitted_unbinds=$'\n'
-    local line
-
-    : > "$output_file"
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        local parsed
-        local mods
-        local key
-        local unbind_key
-
-        if parsed=$(parse_hypr_bind "$line"); then
-            mods="${parsed%%$'\t'*}"
-            key="${parsed#*$'\t'}"
-            unbind_key="${mods}, ${key}"
-
-            if hypr_binding_exists "$original_file" "$mods" "$key"; then
-                case "$emitted_unbinds" in
-                    *$'\n'"$unbind_key"$'\n'*)
-                        ;;
-                    *)
-                        echo "unbind = ${unbind_key}" >> "$output_file"
-                        emitted_unbinds="${emitted_unbinds}${unbind_key}"$'\n'
-                        ;;
-                esac
-            fi
-        fi
-
-        echo "$line" >> "$output_file"
-    done < "$added_lines_file"
-}
-
-get_lua_bind_key() {
-    local line="$1"
-    local key
-
-    key=$(printf '%s\n' "$line" | sed -nE 's/.*hl[.]bind[[:space:]]*[(][[:space:]]*"([^"]+)".*/\1/p')
-    if [ -z "$key" ]; then
-        key=$(printf '%s\n' "$line" | sed -nE "s/.*hl[.]bind[[:space:]]*[(][[:space:]]*'([^']+)'.*/\1/p")
-    fi
-
-    [ -n "$key" ] || return 1
-    printf '%s' "$key"
-}
-
-lua_binding_exists() {
-    local original_file="$1"
-    local expected_key="$2"
-    local line
-
-    while IFS= read -r line || [ -n "$line" ]; do
-        local key
-
-        if key=$(get_lua_bind_key "$line") && [ "$key" = "$expected_key" ]; then
-            return 0
-        fi
-    done < "$original_file"
-
+  mkdir -p -- "$STATE_DIR" || {
+    log_error "Cannot create state directory: $STATE_DIR"
     return 1
-}
+  }
 
-is_lua_partial_line() {
-    local line="$1"
-
-    [[ "$line" =~ ^[[:space:]]*$ ]] && return 1
-    [[ "$line" =~ ^[[:space:]]*-- ]] && return 1
-    [[ "$line" =~ ^[[:space:]] ]] && return 0
-
-    case "$line" in
-        "}"*|"},"*|"]"*|"],"*)
-            return 0
-            ;;
-    esac
-
+  if [[ -L $BASELINE_DIR || ( -e $BASELINE_DIR && ! -d $BASELINE_DIR ) ]]; then
+    log_error "Baseline path is not a safe directory: $BASELINE_DIR"
     return 1
+  fi
+  mkdir -p -- "$BASELINE_DIR" || {
+    log_error "Cannot create baseline directory: $BASELINE_DIR"
+    return 1
+  }
+  if ! make_temp_beside baseline_probe "$BASELINE_DIR/.probe"; then
+    log_error "Baseline directory is not writable: $BASELINE_DIR"
+    return 1
+  fi
+  rm -f -- "$baseline_probe"
+
+  if ! is_safe_regular_or_missing "$lock_path" "Mutation lock"; then
+    return 1
+  fi
+
+  exec {LOCK_FD}>>"$lock_path" || {
+    log_error "Cannot open mutation lock: $lock_path"
+    return 1
+  }
+
+  if ! flock -n "$LOCK_FD"; then
+    log_error "Another Stomarchy mutation is in progress"
+    return 1
+  fi
 }
 
-write_hypr_lua_tweak() {
-    local original_file="$1"
-    local added_lines_file="$2"
-    local output_file="$3"
-    local emitted_unbinds=$'\n'
-    local skipped=false
-    local line
+is_safe_regular_or_missing() {
+  local path=$1
+  local description=$2
 
-    : > "$output_file"
+  if [[ -L $path ]]; then
+    log_error "$description is a symlink; refusing: $path"
+    return 1
+  fi
 
-    while IFS= read -r line || [ -n "$line" ]; do
-        local key
+  if [[ -e $path && ! -f $path ]]; then
+    log_error "$description is not a regular file; refusing: $path"
+    return 1
+  fi
 
-        if is_lua_partial_line "$line"; then
-            skipped=true
-            continue
-        fi
-
-        if key=$(get_lua_bind_key "$line"); then
-            if lua_binding_exists "$original_file" "$key"; then
-                case "$emitted_unbinds" in
-                    *$'\n'"$key"$'\n'*)
-                        ;;
-                    *)
-                        echo "hl.unbind(\"$(escape_double_quoted "$key")\")" >> "$output_file"
-                        emitted_unbinds="${emitted_unbinds}${key}"$'\n'
-                        ;;
-                esac
-            fi
-        fi
-
-        echo "$line" >> "$output_file"
-    done < "$added_lines_file"
-
-    [ "$skipped" = false ]
+  return 0
 }
 
-generate_tweak() {
-    local original_file="$1"
-    local user_file="$2"
-    local config_rel_path="$3"
-    local output_file="$4"
-    local added_lines_file
-    local removed_count
-    local skipped_partial=false
+require_safe_regular() {
+  local path=$1
+  local description=$2
 
-    if diff -q "$original_file" "$user_file" > /dev/null; then
-        : > "$output_file"
-        log_info "No runtime changes detected; created an empty no-op tweak"
-        return 0
+  if ! is_safe_regular_or_missing "$path" "$description"; then
+    return 1
+  fi
+
+  if [[ ! -f $path ]]; then
+    log_error "$description not found: $path"
+    return 1
+  fi
+}
+
+adapter_for() {
+  local rel=$1
+
+  case "$rel" in
+    hypr/*.lua)
+      printf '%s\n' "lua"
+      ;;
+    ghostty/config)
+      printf '%s\n' "ghostty"
+      ;;
+    kitty/*.conf)
+      printf '%s\n' "kitty"
+      ;;
+    tmux/*.conf)
+      printf '%s\n' "tmux"
+      ;;
+    foot/*.ini)
+      printf '%s\n' "foot"
+      ;;
+    .bashrc)
+      printf '%s\n' "bash"
+      ;;
+    .inputrc)
+      printf '%s\n' "full-inputrc"
+      ;;
+    uwsm/default)
+      printf '%s\n' "full-uwsm"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+adapter_is_full_file() {
+  [[ $1 == full-* ]]
+}
+
+target_path_for() {
+  local rel=$1
+
+  case "$rel" in
+    .bashrc|.inputrc)
+      printf '%s\n' "$HOME/$rel"
+      ;;
+    *)
+      printf '%s\n' "$TARGET_CONFIG_HOME/$rel"
+      ;;
+  esac
+}
+
+tracked_path_for() {
+  local rel=$1
+
+  case "$rel" in
+    .bashrc|.inputrc)
+      printf '%s\n' "$STOMARCHY_DIR/$rel"
+      ;;
+    *)
+      printf '%s\n' "$STOMARCHY_CONFIG_ROOT/$rel"
+      ;;
+  esac
+}
+
+original_path_for() {
+  local rel=$1
+
+  case "$rel" in
+    .bashrc)
+      printf '%s\n' "$OMARCHY_ROOT/default/bashrc"
+      ;;
+    *)
+      printf '%s\n' "$OMARCHY_CONFIG_DIR/$rel"
+      ;;
+  esac
+}
+
+target_label_for() {
+  local rel=$1
+  local tilde="~"
+
+  case "$rel" in
+    .bashrc|.inputrc)
+      printf '%s/%s\n' "$tilde" "$rel"
+      ;;
+    *)
+      printf '%s/.config/%s\n' "$tilde" "$rel"
+      ;;
+  esac
+}
+
+validate_path_text() {
+  local path=$1
+
+  if [[ $path == *$'\n'* || $path == *$'\r'* ]]; then
+    log_error "Paths containing newlines are not supported"
+    return 1
+  fi
+}
+
+rel_from_target() {
+  local operand=$1
+  local absolute
+  local config_root
+  local home_root
+
+  validate_path_text "$operand" || return 1
+  absolute=$(normalize_path "$operand") || return 1
+  config_root=$(normalize_path "$TARGET_CONFIG_HOME") || return 1
+  home_root=$(normalize_path "$HOME") || return 1
+
+  case "$absolute" in
+    "$home_root/.bashrc")
+      printf '%s\n' ".bashrc"
+      ;;
+    "$home_root/.inputrc")
+      printf '%s\n' ".inputrc"
+      ;;
+    "$config_root"/*)
+      printf '%s\n' "${absolute#"$config_root"/}"
+      ;;
+    *)
+      log_error "File must be under $TARGET_CONFIG_HOME, ~/.bashrc, or ~/.inputrc"
+      return 1
+      ;;
+  esac
+}
+
+rel_from_tracked() {
+  local operand=$1
+  local absolute
+  local config_root
+  local storage_root
+
+  validate_path_text "$operand" || return 1
+  absolute=$(normalize_path "$operand") || return 1
+  config_root=$(normalize_path "$STOMARCHY_CONFIG_ROOT") || return 1
+  storage_root=$(normalize_path "$STOMARCHY_DIR") || return 1
+
+  case "$absolute" in
+    "$storage_root/.bashrc")
+      printf '%s\n' ".bashrc"
+      ;;
+    "$storage_root/.inputrc")
+      printf '%s\n' ".inputrc"
+      ;;
+    "$config_root"/*)
+      printf '%s\n' "${absolute#"$config_root"/}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+rel_from_operand() {
+  local operand=$1
+  local rel
+
+  if rel=$(rel_from_tracked "$operand" 2>/dev/null); then
+    printf '%s\n' "$rel"
+  else
+    rel_from_target "$operand"
+  fi
+}
+
+collect_tracked_rels() {
+  local tracked_file
+  local rel
+  local -a files=()
+
+  RELS=()
+
+  if [[ -d $STOMARCHY_CONFIG_ROOT ]]; then
+    while IFS= read -r -d '' tracked_file; do
+      files+=("$tracked_file")
+    done < <(find "$STOMARCHY_CONFIG_ROOT" -mindepth 1 \( -type f -o -type l \) -print0)
+  fi
+
+  for tracked_file in "$STOMARCHY_DIR/.bashrc" "$STOMARCHY_DIR/.inputrc"; do
+    if [[ -e $tracked_file || -L $tracked_file ]]; then
+      files+=("$tracked_file")
     fi
+  done
 
-    added_lines_file=$(mktemp)
-    write_added_lines "$original_file" "$user_file" "$added_lines_file"
-    removed_count=$(count_removed_lines "$original_file" "$user_file")
+  if ((${#files[@]} == 0)); then
+    return 0
+  fi
 
-    case "$config_rel_path" in
-        hypr/*.conf)
-            write_hypr_conf_tweak "$original_file" "$added_lines_file" "$output_file"
-            ;;
-        hypr/*.lua)
-            if ! write_hypr_lua_tweak "$original_file" "$added_lines_file" "$output_file"; then
-                skipped_partial=true
-            fi
-            ;;
-        *)
-            cp "$added_lines_file" "$output_file"
-            ;;
-    esac
-
-    rm -f "$added_lines_file"
-
-    if [ "$skipped_partial" = true ]; then
-        log_warn "Skipped Lua edits that are not safe as standalone top-level tweaks"
+  while IFS= read -r -d '' tracked_file; do
+    if rel=$(rel_from_tracked "$tracked_file"); then
+      RELS+=("$rel")
     fi
+  done < <(printf '%s\0' "${files[@]}" | LC_ALL=C sort -z)
+}
 
-    if [ "$removed_count" -gt 0 ]; then
-        if [ -s "$output_file" ]; then
-            log_warn "Some deletions or reorders cannot be represented as runtime tweaks"
-        else
-            log_warn "Only deletions or reorders detected; created an empty no-op tweak"
-        fi
-    elif [ ! -s "$output_file" ]; then
-        log_info "No runtime changes detected; created an empty no-op tweak"
-    fi
+collect_mirror_rels() {
+  local original
+  local rel
+  local -a rels=()
+
+  RELS=()
+
+  if [[ ! -d $OMARCHY_CONFIG_DIR ]]; then
+    log_error "Omarchy config directory not found: $OMARCHY_CONFIG_DIR"
+    return 1
+  fi
+
+  while IFS= read -r -d '' original; do
+    rel=${original#"$OMARCHY_CONFIG_DIR"/}
+    validate_path_text "$rel" || return 1
+    rels+=("$rel")
+  done < <(find "$OMARCHY_CONFIG_DIR" -type f -print0)
+
+  if [[ -f $OMARCHY_ROOT/default/bashrc && ! -L $OMARCHY_ROOT/default/bashrc ]]; then
+    rels+=(".bashrc")
+  fi
+
+  if ((${#rels[@]} > 0)); then
+    while IFS= read -r -d '' rel; do
+      RELS+=("$rel")
+    done < <(printf '%s\0' "${rels[@]}" | LC_ALL=C sort -zu)
+  fi
+}
+
+collect_all_rels() {
+  local rel
+  local -a all_rels=()
+
+  collect_mirror_rels || return 1
+  all_rels+=("${RELS[@]}")
+
+  collect_tracked_rels
+  all_rels+=("${RELS[@]}")
+  RELS=()
+
+  if ((${#all_rels[@]} > 0)); then
+    while IFS= read -r -d '' rel; do
+      RELS+=("$rel")
+    done < <(printf '%s\0' "${all_rels[@]}" | LC_ALL=C sort -zu)
+  fi
+}
+
+marker_prefix_for() {
+  if [[ $1 == "lua" ]]; then
+    printf '%s\n' "--"
+  else
+    printf '%s\n' "#"
+  fi
+}
+
+validate_markers() {
+  local file=$1
+  local adapter=$2
+  local prefix
+  local begin
+  local end
+
+  if adapter_is_full_file "$adapter"; then
+    return 0
+  fi
+
+  prefix=$(marker_prefix_for "$adapter")
+  begin="$prefix BEGIN Stomarchy tweaks"
+  end="$prefix END Stomarchy tweaks"
+
+  awk -v begin="$begin" -v end="$end" '
+    $0 == begin {
+      if (inside || count > 0) {
+        exit 2
+      }
+      inside = 1
+      count++
+      next
+    }
+    $0 == end {
+      if (!inside) {
+        exit 2
+      }
+      inside = 0
+      next
+    }
+    /^[[:space:]]*(#|--)[[:space:]]*(BEGIN|END)[[:space:]]+Stomarchy/ {
+      exit 2
+    }
+    END {
+      if (inside) {
+        exit 2
+      }
+    }
+  ' "$file"
+}
+
+has_stomarchy_marker() {
+  local file=$1
+  local adapter=$2
+  local prefix
+
+  prefix=$(marker_prefix_for "$adapter")
+  grep -Fxq -- "$prefix BEGIN Stomarchy tweaks" "$file"
+}
+
+quote_lua() {
+  local value=$1
+
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  printf '"%s"' "$value"
+}
+
+quote_double_config() {
+  local value=$1
+
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+quote_tmux() {
+  local value=$1
+
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//\$/\\\$}
+  value=${value//\`/\\\`}
+  printf '"%s"' "$value"
+}
+
+import_directive_for() {
+  local adapter=$1
+  local tracked=$2
+  local quoted
+
+  validate_path_text "$tracked" || return 1
+
+  case "$adapter" in
+    lua)
+      printf 'dofile(%s)\n' "$(quote_lua "$tracked")"
+      ;;
+    ghostty)
+      printf 'config-file = %s\n' "$(quote_double_config "$tracked")"
+      ;;
+    kitty)
+      printf 'include %s\n' "$(quote_double_config "$tracked")"
+      ;;
+    tmux)
+      printf 'source-file -q %s\n' "$(quote_tmux "$tracked")"
+      ;;
+    foot)
+      printf 'include=%s\n' "$tracked"
+      ;;
+    bash)
+      printf -v quoted '%q' "$tracked"
+      printf 'source %s\n' "$quoted"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 append_import_block() {
-    local output_file="$1"
-    local config_rel_path="$2"
-    local import_directive="$3"
-    local comment_prefix
+  local file=$1
+  local adapter=$2
+  local tracked=$3
+  local prefix
+  local directive
 
-    comment_prefix=$(get_comment_prefix "$config_rel_path")
+  prefix=$(marker_prefix_for "$adapter") || return 1
+  directive=$(import_directive_for "$adapter" "$tracked") || return 1
 
-    {
-        echo ""
-        echo "${comment_prefix} BEGIN Stomarchy tweaks"
-        echo "$import_directive"
-        echo "${comment_prefix} END Stomarchy tweaks"
-    } >> "$output_file"
+  printf '\n%s BEGIN Stomarchy tweaks\n' "$prefix" >>"$file"
+  if [[ $adapter == "foot" ]]; then
+    printf '[main]\n' >>"$file"
+  fi
+  printf '%s\n' "$directive" >>"$file"
+  printf '%s END Stomarchy tweaks\n' "$prefix" >>"$file"
 }
 
-show_file_diff() {
-    local current_file="$1"
-    local desired_file="$2"
-    local current_label="$3"
-    local desired_label="$4"
+build_append_target() {
+  local original=$1
+  local adapter=$2
+  local tracked=$3
+  local output_name=$4
+  local built_file
 
-    if [ -f "$current_file" ]; then
-        diff -u --label "$current_label" --label "$desired_label" "$current_file" "$desired_file" || true
-    else
-        diff -u --label "$current_label" --label "$desired_label" /dev/null "$desired_file" || true
-    fi
+  make_temp built_file || return 1
+  cp -p -- "$original" "$built_file" || return 1
+  chmod u+w -- "$built_file" || return 1
+  append_import_block "$built_file" "$adapter" "$tracked" || return 1
+  chmod --reference="$original" -- "$built_file" || return 1
+  printf -v "$output_name" '%s' "$built_file"
 }
 
-print_tweak_preview() {
-    local tweak_file="$1"
-    local tweak_path="$2"
-    local target_file="$3"
-    local original_file="$4"
-    local import_directive="$5"
+validate_tweak() {
+  local adapter=$1
+  local file=$2
+  local quiet=${3:-false}
 
-    log_info "Dry run: no files changed"
-    log_info "Would write tweak: $tweak_path"
-    echo "--- tweak: ${tweak_path} ---"
-    if [ -s "$tweak_file" ]; then
-        cat "$tweak_file"
-    else
-        echo "(empty no-op tweak)"
-    fi
-    echo "--- end tweak ---"
-    log_info "Would restore target from: $original_file"
-    log_info "Would add import block to: $target_file"
-    echo "$import_directive"
-}
-
-restore_target_with_import() {
-    local config_rel_path="$1"
-    local tracked_file="$2"
-    local original_file="$3"
-    local target_file
-    local import_directive
-    local desired_file
-
-    target_file=$(get_target_path "$config_rel_path")
-    import_directive=$(get_import_directive "$config_rel_path" "$tracked_file")
-
-    desired_file=$(mktemp)
-    cp -p "$original_file" "$desired_file"
-    append_import_block "$desired_file" "$config_rel_path" "$import_directive"
-
-    if [ -f "$target_file" ] && cmp -s "$target_file" "$desired_file"; then
-        log_info "Target already restored with Stomarchy import: $target_file"
-        rm -f "$desired_file"
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$target_file")"
-
-    cp -p "$desired_file" "$target_file"
-    rm -f "$desired_file"
-
-    log_info "Restored Omarchy default and added import directive to: $target_file"
-}
-
-restore_target_base() {
-    local config_rel_path="$1"
-    local original_file="$2"
-    local target_file
-
-    target_file=$(get_target_path "$config_rel_path")
-
-    if [ -f "$target_file" ] && cmp -s "$target_file" "$original_file"; then
-        log_info "Target already matches Omarchy default: $target_file"
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$target_file")"
-
-    cp -p "$original_file" "$target_file"
-    log_info "Restored Omarchy default to: $target_file"
-}
-
-write_synced_target() {
-    local config_rel_path="$1"
-    local original_file="$2"
-    local dry_run="${3:-false}"
-    local target_file
-    local tracked_file
-    local desired_file
-    local import_applied=false
-
-    target_file=$(get_target_path "$config_rel_path")
-    tracked_file=$(get_stomarchy_path "$config_rel_path")
-    desired_file=$(mktemp)
-
-    cp -p "$original_file" "$desired_file"
-
-    if [ -f "$tracked_file" ]; then
-        if is_supported_config "$config_rel_path"; then
-            append_import_block "$desired_file" "$config_rel_path" "$(get_import_directive "$config_rel_path" "$tracked_file")"
-            import_applied=true
-        else
-            log_warn "Tweak uses unsupported format, skipping import: $tracked_file"
-        fi
-    fi
-
-    if [ -f "$target_file" ] && cmp -s "$target_file" "$desired_file"; then
-        rm -f "$desired_file"
-        if [ "$import_applied" = true ]; then
-            SYNC_RESULT="unchanged_import"
-        else
-            SYNC_RESULT="unchanged"
-        fi
-        return 0
-    fi
-
-    if [ "$dry_run" = true ]; then
-        if [ -f "$target_file" ]; then
-            log_info "Would update: $(format_target_label "$config_rel_path")"
-            show_file_diff "$target_file" "$desired_file" "$target_file (current)" "$target_file (after sync)"
-        else
-            log_info "Would create: $(format_target_label "$config_rel_path")"
-            show_file_diff "$target_file" "$desired_file" "/dev/null" "$target_file (after sync)"
-        fi
-
-        rm -f "$desired_file"
-        if [ "$import_applied" = true ]; then
-            SYNC_RESULT="would_sync_import"
-        else
-            SYNC_RESULT="would_sync"
-        fi
-        return 0
-    fi
-
-    mkdir -p "$(dirname "$target_file")"
-
-    cp -p "$desired_file" "$target_file"
-    rm -f "$desired_file"
-
-    if [ "$import_applied" = true ]; then
-        SYNC_RESULT="synced_import"
-    else
-        SYNC_RESULT="synced"
-    fi
-}
-
-# Track a tweak and update the target file
-cmd_add() {
-    local dry_run=false
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --dry-run|--preview|-n)
-                dry_run=true
-                shift
-                ;;
-            --)
-                shift
-                break
-                ;;
-            -*)
-                log_error "Unknown add option: $1"
-                log_info "Usage: stomarchy add [--dry-run] <file>"
-                exit 1
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-
-    if [ -z "${1:-}" ]; then
-        log_error "Usage: stomarchy add [--dry-run] <file>"
-        exit 1
-    fi
-    
-    local source_file="$1"
-    
-    if [ ! -f "$source_file" ]; then
-        log_error "File not found: $source_file"
-        exit 1
-    fi
-
-    if [ "$dry_run" = false ]; then
-        init_dirs
-    fi
-
-    local config_rel_path
-    config_rel_path=$(get_config_rel_path "$source_file")
-
-    if ! is_supported_config "$config_rel_path"; then
-        log_error "Unsupported config format: $(format_target_label "$config_rel_path")"
-        log_info "Supported formats: Hyprland .conf/.lua, kitty, ghostty, foot, tmux, ~/.bashrc, ~/.inputrc, and shell-style files"
-        exit 1
-    fi
-
-    local original_file
-    original_file=$(get_omarchy_original_path "$config_rel_path")
-
-    if [ ! -f "$original_file" ]; then
-        log_error "Omarchy original not found: $original_file"
-        log_info "Stomarchy can only track files that have untouched originals in $OMARCHY_CONFIG_DIR"
-        exit 1
-    fi
-
-    local stomarchy_path
-    stomarchy_path=$(get_stomarchy_path "$config_rel_path")
-
-    local cleaned_source
-    local source_is_managed=false
-    local generated_tweak
-    local should_write_tweak=false
-    cleaned_source=$(mktemp)
-    generated_tweak=$(mktemp)
-    strip_stomarchy_blocks "$source_file" "$cleaned_source"
-
-    if [ -f "$stomarchy_path" ] && has_stomarchy_block "$source_file"; then
-        source_is_managed=true
-    fi
-
-    if [ "$source_is_managed" = true ]; then
-        log_info "Managed target detected; keeping existing tweak"
-        cp "$stomarchy_path" "$generated_tweak"
-    elif [ -f "$stomarchy_path" ] && diff -q "$original_file" "$cleaned_source" > /dev/null; then
-        log_info "Target is already restored; keeping existing tweak"
-        cp "$stomarchy_path" "$generated_tweak"
-    else
-        generate_tweak "$original_file" "$cleaned_source" "$config_rel_path" "$generated_tweak"
-        should_write_tweak=true
-    fi
-
-    rm -f "$cleaned_source"
-
-    if [ "$dry_run" = true ]; then
-        print_tweak_preview \
-            "$generated_tweak" \
-            "$stomarchy_path" \
-            "$(get_target_path "$config_rel_path")" \
-            "$original_file" \
-            "$(get_import_directive "$config_rel_path" "$stomarchy_path")"
-        rm -f "$generated_tweak"
-        return 0
-    fi
-
-    if [ "$should_write_tweak" = true ]; then
-        mkdir -p "$(dirname "$stomarchy_path")"
-        cp "$generated_tweak" "$stomarchy_path"
-    fi
-
-    rm -f "$generated_tweak"
-
-    restore_target_with_import "$config_rel_path" "$stomarchy_path" "$original_file"
-
-    log_success "Added: $source_file"
-    log_info "Tweak at: $stomarchy_path"
-    log_info "Tweak generated or preserved from differences with: $original_file"
-}
-
-# Stop tracking a local file and restore the Omarchy default
-cmd_remove() {
-    if [ -z "$1" ]; then
-        log_error "Usage: stomarchy remove <file>"
-        exit 1
-    fi
-
-    init_dirs
-
-    local target_arg="$1"
-    local config_rel_path
-    config_rel_path=$(get_config_rel_path "$target_arg")
-
-    local original_file
-    original_file=$(get_omarchy_original_path "$config_rel_path")
-
-    if [ ! -f "$original_file" ]; then
-        log_error "Omarchy original not found: $original_file"
-        log_info "Stomarchy can only restore files that have untouched originals in $OMARCHY_CONFIG_DIR"
-        exit 1
-    fi
-
-    local stomarchy_path
-    stomarchy_path=$(get_stomarchy_path "$config_rel_path")
-
-    if [ -f "$stomarchy_path" ]; then
-        rm -f "$stomarchy_path"
-        log_info "Removed tweak: $stomarchy_path"
-    else
-        log_info "No tweak found for: $(format_target_label "$config_rel_path")"
-    fi
-
-    restore_target_base "$config_rel_path" "$original_file"
-
-    log_success "Removed: $target_arg"
-}
-
-link_tracked_file() {
-    local tracked_file="$1"
-    local config_rel_path
-
-    if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
-        log_warn "Unsupported tweak path, skipping: $tracked_file"
+  case "$adapter" in
+    lua)
+      if ! command -v luac >/dev/null 2>&1; then
+        [[ $quiet == true ]] || log_error "luac is required for Hyprland Lua overlays"
         return 1
-    fi
-
-    if ! is_supported_config "$config_rel_path"; then
-        log_warn "Unsupported config format, skipping: $(format_target_label "$config_rel_path")"
+      fi
+      if [[ $quiet == true ]]; then
+        luac -p "$file" >/dev/null 2>&1
+      else
+        luac -p "$file" || {
+          log_error "Lua overlay is not a valid standalone chunk: $file"
+          return 1
+        }
+      fi
+      ;;
+    bash)
+      if [[ $quiet == true ]]; then
+        bash -n "$file" >/dev/null 2>&1
+      else
+        bash -n "$file" || {
+          log_error "Bash overlay has invalid syntax: $file"
+          return 1
+        }
+      fi
+      ;;
+    foot)
+      if ! command -v foot >/dev/null 2>&1; then
+        [[ $quiet == true ]] || log_error "foot is required to validate Foot overlays"
         return 1
-    fi
+      fi
+      if [[ $quiet == true ]]; then
+        foot -C -c "$file" >/dev/null 2>&1
+      else
+        foot -C -c "$file" || {
+          log_error "Foot overlay failed validation: $file"
+          return 1
+        }
+      fi
+      ;;
+  esac
 
-    local original_file
-    original_file=$(get_omarchy_original_path "$config_rel_path")
+  return 0
+}
 
-    if [ ! -f "$original_file" ]; then
-        log_warn "Omarchy original not found, skipping: $original_file"
+validate_assembled() {
+  local adapter=$1
+  local file=$2
+  local quiet=${3:-false}
+
+  if ! validate_markers "$file" "$adapter"; then
+    [[ $quiet == true ]] || log_error "Malformed or nested Stomarchy markers: $file"
+    return 1
+  fi
+
+  case "$adapter" in
+    lua)
+      if [[ $quiet == true ]]; then
+        luac -p "$file" >/dev/null 2>&1
+      else
+        luac -p "$file" || {
+          log_error "Assembled Lua target failed validation: $file"
+          return 1
+        }
+      fi
+      ;;
+    bash)
+      if [[ $quiet == true ]]; then
+        bash -n "$file" >/dev/null 2>&1
+      else
+        bash -n "$file" || {
+          log_error "Assembled Bash target failed validation: $file"
+          return 1
+        }
+      fi
+      ;;
+    foot)
+      if ! command -v foot >/dev/null 2>&1; then
+        [[ $quiet == true ]] || log_error "foot is required to validate assembled Foot targets"
         return 1
-    fi
+      fi
+      if [[ $quiet == true ]]; then
+        foot -C -c "$file" >/dev/null 2>&1
+      else
+        foot -C -c "$file" || {
+          log_error "Assembled Foot target failed validation: $file"
+          return 1
+        }
+      fi
+      ;;
+  esac
 
-    restore_target_with_import "$config_rel_path" "$tracked_file" "$original_file"
-    log_info "Linked: $(format_target_label "$config_rel_path")"
+  return 0
+}
+
+extract_exact_suffix() {
+  local original=$1
+  local target=$2
+  local output_name=$3
+  local original_size
+  local target_size
+  local suffix_file
+
+  original_size=$(stat -c '%s' -- "$original") || return 1
+  target_size=$(stat -c '%s' -- "$target") || return 1
+
+  if ((target_size < original_size)); then
+    return 1
+  fi
+
+  if ((original_size > 0)) && ! cmp -s -n "$original_size" -- "$original" "$target"; then
+    return 1
+  fi
+
+  make_temp suffix_file || return 1
+  if ! tail -c "+$((original_size + 1))" -- "$target" >"$suffix_file"; then
+    return 1
+  fi
+
+  printf -v "$output_name" '%s' "$suffix_file"
+}
+
+hash_file() {
+  sha256sum -- "$1" | awk '{ print $1 }'
+}
+
+hash_text() {
+  printf '%s' "$1" | sha256sum | awk '{ print $1 }'
+}
+
+baseline_path_for() {
+  local rel=$1
+  local key
+
+  key=$(hash_text "$rel") || return 1
+  printf '%s/%s\n' "$BASELINE_DIR" "$key"
+}
+
+BASELINE_ORIGINAL=""
+BASELINE_TARGET=""
+BASELINE_TWEAK=""
+BASELINE_MODE=""
+
+load_baseline() {
+  local rel=$1
+  local path
+  local key
+  local value
+  local version=""
+
+  BASELINE_ORIGINAL=""
+  BASELINE_TARGET=""
+  BASELINE_TWEAK=""
+  BASELINE_MODE=""
+
+  path=$(baseline_path_for "$rel") || return 2
+  if [[ ! -e $path ]]; then
+    return 1
+  fi
+  if [[ -L $path || ! -f $path ]]; then
+    return 2
+  fi
+
+  while IFS='=' read -r key value; do
+    case "$key" in
+      version)
+        version=$value
+        ;;
+      original)
+        BASELINE_ORIGINAL=$value
+        ;;
+      target)
+        BASELINE_TARGET=$value
+        ;;
+      tweak)
+        BASELINE_TWEAK=$value
+        ;;
+      mode)
+        BASELINE_MODE=$value
+        ;;
+      *)
+        return 2
+        ;;
+    esac
+  done <"$path"
+
+  if [[ $version != "1" ||
+        ! $BASELINE_ORIGINAL =~ ^(-|[[:xdigit:]]{64})$ ||
+        ! $BASELINE_TARGET =~ ^[[:xdigit:]]{64}$ ||
+        ! $BASELINE_TWEAK =~ ^[[:xdigit:]]{64}$ ||
+        ! $BASELINE_MODE =~ ^(append|full)$ ]]; then
+    return 2
+  fi
+
+  return 0
+}
+
+write_baseline() {
+  local rel=$1
+  local original_hash=$2
+  local target_hash=$3
+  local tweak_hash=$4
+  local mode=$5
+  local path
+  local staged
+
+  path=$(baseline_path_for "$rel") || return 1
+  mkdir -p -- "$BASELINE_DIR" || return 1
+  make_temp_beside staged "$path" || return 1
+
+  {
+    printf 'version=1\n'
+    printf 'original=%s\n' "$original_hash"
+    printf 'target=%s\n' "$target_hash"
+    printf 'tweak=%s\n' "$tweak_hash"
+    printf 'mode=%s\n' "$mode"
+  } >"$staged"
+
+  chmod 600 "$staged" || return 1
+  atomic_replace "$staged" "$path"
+}
+
+delete_baseline() {
+  local rel=$1
+  local path
+
+  path=$(baseline_path_for "$rel") || return 1
+  if [[ -L $path ]]; then
+    log_error "Baseline record is a symlink; refusing: $path"
+    return 1
+  fi
+  rm -f -- "$path"
+}
+
+ensure_recovery_dir() {
+  local timestamp
+  local recovery_root="$STATE_DIR/recovery"
+
+  if [[ -n $RECOVERY_DIR ]]; then
     return 0
+  fi
+
+  timestamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  if [[ -L $recovery_root || ( -e $recovery_root && ! -d $recovery_root ) ]]; then
+    log_error "Recovery path is not a safe directory: $recovery_root"
+    return 1
+  fi
+  RECOVERY_DIR="$recovery_root/${timestamp}-$$"
+  mkdir -p -- "$RECOVERY_DIR/targets" "$RECOVERY_DIR/tweaks" || return 1
+  log_warn "Recovery snapshot: $RECOVERY_DIR"
 }
 
-# Link checked-out tweaks into local files
-cmd_link() {
-    init_dirs
+snapshot_rel() {
+  local rel=$1
+  local target
+  local tracked
+  local target_snapshot
+  local tweak_snapshot
+  local snapped
 
-    local linked_count=0
-    local skipped_count=0
-    local tracked_file
-    local filename
+  for snapped in "${SNAPSHOTTED[@]}"; do
+    [[ $snapped == "$rel" ]] && return 0
+  done
 
-    if [ -n "${1:-}" ]; then
-        local link_arg="$1"
-        local config_rel_path
+  ensure_recovery_dir || return 1
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
 
-        if config_rel_path=$(get_config_rel_path_from_tracked "$link_arg"); then
-            tracked_file=$(realpath -m "$link_arg")
-        else
-            config_rel_path=$(get_config_rel_path "$link_arg")
-            tracked_file=$(get_stomarchy_path "$config_rel_path")
-        fi
+  case "$rel" in
+    .bashrc|.inputrc)
+      target_snapshot="$RECOVERY_DIR/targets/home/$rel"
+      tweak_snapshot="$RECOVERY_DIR/tweaks/home/$rel"
+      ;;
+    *)
+      target_snapshot="$RECOVERY_DIR/targets/config/$rel"
+      tweak_snapshot="$RECOVERY_DIR/tweaks/config/$rel"
+      ;;
+  esac
 
-        if [ ! -f "$tracked_file" ]; then
-            log_error "Tweak not found: $tracked_file"
-            exit 1
-        fi
+  if [[ -f $target && ! -L $target ]]; then
+    mkdir -p -- "$(dirname -- "$target_snapshot")" || return 1
+    cp -p -- "$target" "$target_snapshot" || return 1
+  else
+    printf '%s\n' "$(target_label_for "$rel")" >>"$RECOVERY_DIR/missing-targets"
+  fi
 
-        if link_tracked_file "$tracked_file"; then
-            linked_count=$((linked_count + 1))
-        else
-            skipped_count=$((skipped_count + 1))
-        fi
-    else
-        while IFS= read -r -d '' tracked_file; do
-            filename=$(basename "$tracked_file")
-            if [[ "$filename" == .stomarchy-* ]]; then
-                continue
-            fi
+  if [[ -f $tracked && ! -L $tracked ]]; then
+    mkdir -p -- "$(dirname -- "$tweak_snapshot")" || return 1
+    cp -p -- "$tracked" "$tweak_snapshot" || return 1
+  fi
 
-            if link_tracked_file "$tracked_file"; then
-                linked_count=$((linked_count + 1))
-            else
-                skipped_count=$((skipped_count + 1))
-            fi
-        done < <(find_tracked_files)
-    fi
-
-    if [ "$linked_count" -eq 0 ]; then
-        log_warn "No tweaks linked"
-    else
-        log_success "Linked $linked_count tweak(s), skipped $skipped_count"
-    fi
+  SNAPSHOTTED+=("$rel")
 }
 
-# Sync user configs from the current local Omarchy defaults
-cmd_sync() {
-    local dry_run=false
+show_diff() {
+  local current=$1
+  local desired=$2
+  local label=$3
 
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --dry-run|--preview|-n)
-                dry_run=true
-                shift
-                ;;
-            --)
-                shift
-                break
-                ;;
-            -*)
-                log_error "Unknown sync option: $1"
-                log_info "Usage: stomarchy sync [--dry-run]"
-                exit 1
-                ;;
-            *)
-                log_error "Unexpected sync argument: $1"
-                log_info "Usage: stomarchy sync [--dry-run]"
-                exit 1
-                ;;
-        esac
+  if [[ -f $current && ! -L $current ]]; then
+    diff -u --label "$label (current)" --label "$label (desired)" "$current" "$desired" || true
+  else
+    diff -u --label "$label (missing)" --label "$label (desired)" /dev/null "$desired" || true
+  fi
+}
+
+stage_and_replace() {
+  local desired=$1
+  local destination=$2
+  local adapter=${3:-}
+  local staged
+
+  make_temp_beside staged "$destination" || return 1
+  cp -p -- "$desired" "$staged" || return 1
+
+  if [[ -n $adapter && ! $adapter == full-* ]]; then
+    validate_assembled "$adapter" "$staged" || return 1
+  fi
+
+  atomic_replace "$staged" "$destination"
+}
+
+replacement_is_safe_append() {
+  local rel=$1
+  local target=$2
+  local original=$3
+  local desired=$4
+  local managed_desired=${5:-}
+  local current_hash
+  local original_hash
+  local baseline_result
+
+  if [[ ! -e $target ]]; then
+    load_baseline "$rel"
+    baseline_result=$?
+    if ((baseline_result == 0)); then
+      return 1
+    fi
+    ((baseline_result == 1)) && return 0
+    return 2
+  fi
+
+  cmp -s -- "$target" "$desired" && return 0
+
+  load_baseline "$rel"
+  baseline_result=$?
+  if ((baseline_result == 0)); then
+    current_hash=$(hash_file "$target") || return 2
+    if [[ $current_hash == "$BASELINE_TARGET" ]]; then
+      return 0
+    fi
+
+    original_hash=$(hash_file "$original") || return 2
+    if [[ $BASELINE_ORIGINAL != "$original_hash" ]] && cmp -s -- "$target" "$original"; then
+      return 0
+    fi
+
+    return 1
+  fi
+
+  if ((baseline_result == 2)); then
+    return 2
+  fi
+
+  cmp -s -- "$target" "$original" && return 0
+  if [[ -n $managed_desired ]] && cmp -s -- "$target" "$managed_desired"; then
+    return 0
+  fi
+
+  return 1
+}
+
+replacement_is_safe_full() {
+  local rel=$1
+  local target=$2
+  local desired=$3
+  local current_hash
+  local baseline_result
+
+  if [[ ! -e $target ]]; then
+    load_baseline "$rel"
+    baseline_result=$?
+    if ((baseline_result == 0)); then
+      return 1
+    fi
+    ((baseline_result == 1)) && return 0
+    return 2
+  fi
+
+  cmp -s -- "$target" "$desired" && return 0
+
+  load_baseline "$rel"
+  baseline_result=$?
+  if ((baseline_result == 0)); then
+    current_hash=$(hash_file "$target") || return 2
+    [[ $current_hash == "$BASELINE_TARGET" ]] && return 0
+    return 1
+  fi
+
+  ((baseline_result == 1)) && return 1
+  return 2
+}
+
+record_current_baseline() {
+  local rel=$1
+  local adapter=$2
+  local target=$3
+  local tracked=$4
+  local original=${5:-}
+  local original_hash="-"
+  local target_hash
+  local tweak_hash
+  local mode="append"
+
+  if adapter_is_full_file "$adapter"; then
+    mode="full"
+  else
+    original_hash=$(hash_file "$original") || return 1
+  fi
+
+  target_hash=$(hash_file "$target") || return 1
+  tweak_hash=$(hash_file "$tracked") || return 1
+  write_baseline "$rel" "$original_hash" "$target_hash" "$tweak_hash" "$mode"
+}
+
+prepare_tracked_desired() {
+  local rel=$1
+  local action=$2
+  local output_name=$3
+  local adapter
+  local tracked
+  local original
+  local prepared_file
+
+  adapter=$(adapter_for "$rel") || return 1
+  tracked=$(tracked_path_for "$rel")
+
+  if adapter_is_full_file "$adapter"; then
+    if [[ $action == "wipe" || $action == "remove" ]]; then
+      printf -v "$output_name" '%s' ""
+      return 0
+    fi
+    make_temp prepared_file || return 1
+    cp -p -- "$tracked" "$prepared_file" || return 1
+    printf -v "$output_name" '%s' "$prepared_file"
+    return 0
+  fi
+
+  original=$(original_path_for "$rel")
+  if [[ $action == "wipe" || $action == "remove" ]]; then
+    make_temp prepared_file || return 1
+    cp -p -- "$original" "$prepared_file" || return 1
+  else
+    build_append_target "$original" "$adapter" "$tracked" prepared_file || return 1
+  fi
+
+  printf -v "$output_name" '%s' "$prepared_file"
+}
+
+preflight_tracked_rel() {
+  local rel=$1
+  local action=$2
+  local force=$3
+  local adapter
+  local target
+  local tracked
+  local original
+  local desired
+  local managed_desired=""
+  local safe_result
+
+  if ! adapter=$(adapter_for "$rel"); then
+    log_error "Unsupported tracked adapter: $(target_label_for "$rel")"
+    return 1
+  fi
+
+  tracked=$(tracked_path_for "$rel")
+  target=$(target_path_for "$rel")
+
+  require_safe_regular "$tracked" "Tracked tweak" || return 1
+  is_safe_regular_or_missing "$target" "Target" || return 1
+  validate_tweak "$adapter" "$tracked" || return 1
+
+  if ! adapter_is_full_file "$adapter"; then
+    original=$(original_path_for "$rel")
+    require_safe_regular "$original" "Omarchy original" || return 1
+
+    if [[ -f $target ]] && ! validate_markers "$target" "$adapter"; then
+      if [[ $force == true ]]; then
+        log_warn "Malformed markers will be replaced under --force: $target"
+      else
+        log_error "Malformed or nested Stomarchy markers: $target"
+        return 1
+      fi
+    fi
+  fi
+
+  prepare_tracked_desired "$rel" "$action" desired || return 1
+
+  if adapter_is_full_file "$adapter" && [[ $action == "wipe" || $action == "remove" ]]; then
+    return 0
+  fi
+
+  if ! adapter_is_full_file "$adapter"; then
+    if [[ $action != "wipe" && $action != "remove" ]]; then
+      validate_assembled "$adapter" "$desired" || return 1
+    fi
+    if [[ $action == "wipe" || $action == "remove" ]]; then
+      build_append_target "$original" "$adapter" "$tracked" managed_desired || return 1
+    fi
+    replacement_is_safe_append "$rel" "$target" "$original" "$desired" "$managed_desired"
+    safe_result=$?
+  else
+    replacement_is_safe_full "$rel" "$target" "$desired"
+    safe_result=$?
+  fi
+
+  if ((safe_result == 2)); then
+    log_error "Invalid baseline state for: $(target_label_for "$rel")"
+    return 1
+  fi
+
+  if ((safe_result == 1)) && [[ $force != true ]]; then
+    log_error "Target drift detected; refusing to overwrite: $target"
+    log_error "Reconcile the target or rerun this command with --force"
+    return 1
+  fi
+
+  return 0
+}
+
+operate_tracked_rel() {
+  local rel=$1
+  local action=$2
+  local dry_run=$3
+  local force=$4
+  local adapter
+  local target
+  local tracked
+  local original=""
+  local desired
+  local label
+
+  adapter=$(adapter_for "$rel") || return 1
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
+  label=$(target_label_for "$rel")
+
+  if ! adapter_is_full_file "$adapter"; then
+    original=$(original_path_for "$rel")
+  fi
+
+  prepare_tracked_desired "$rel" "$action" desired || return 1
+
+  if adapter_is_full_file "$adapter" && [[ $action == "wipe" ]]; then
+    log_info "Left user-owned full file intact: $label"
+    return 0
+  fi
+
+  if adapter_is_full_file "$adapter" && [[ $action == "remove" ]]; then
+    if [[ $dry_run == true ]]; then
+      log_info "Would remove tracked copy and leave target intact: $label"
+      return 0
+    fi
+
+    if [[ $force == true ]]; then
+      snapshot_rel "$rel" || return 1
+    fi
+    rm -f -- "$tracked" || return 1
+    delete_baseline "$rel" || return 1
+    log_info "Removed tracked copy; target left intact: $label"
+    return 0
+  fi
+
+  if [[ $dry_run == true ]]; then
+    if cmp -s -- "$target" "$desired" 2>/dev/null; then
+      log_info "Would leave unchanged: $label"
+    else
+      log_info "Would update: $label"
+      show_diff "$target" "$desired" "$label"
+    fi
+    if [[ $action == "remove" ]]; then
+      log_info "Would remove tracked tweak after restoring: $tracked"
+    fi
+    return 0
+  fi
+
+  if [[ $force == true ]] && ! cmp -s -- "$target" "$desired" 2>/dev/null; then
+    snapshot_rel "$rel" || return 1
+  fi
+
+  if ! cmp -s -- "$target" "$desired" 2>/dev/null; then
+    stage_and_replace "$desired" "$target" "$adapter" || {
+      log_error "Failed to update target: $target"
+      return 1
+    }
+  fi
+
+  if [[ $action == "remove" ]]; then
+    if [[ $force == true ]]; then
+      snapshot_rel "$rel" || return 1
+    fi
+    rm -f -- "$tracked" || {
+      log_error "Target was restored, but the tweak could not be removed: $tracked"
+      return 1
+    }
+    delete_baseline "$rel" || return 1
+    log_info "Restored and removed: $label"
+    return 0
+  fi
+
+  record_current_baseline "$rel" "$adapter" "$target" "$tracked" "$original" || {
+    log_error "Target updated, but baseline state could not be recorded: $label"
+    return 1
+  }
+
+  case "$action" in
+    link)
+      log_info "Linked: $label"
+      ;;
+    sync)
+      log_info "Synced: $label"
+      ;;
+    wipe)
+      log_info "Wiped import: $label"
+      ;;
+  esac
+}
+
+add_existing() {
+  local rel=$1
+  local adapter=$2
+  local target=$3
+  local tracked=$4
+  local dry_run=$5
+  local original=""
+  local desired
+  local current_hash
+  local original_hash
+  local baseline_result
+
+  validate_tweak "$adapter" "$tracked" || return 1
+
+  if adapter_is_full_file "$adapter"; then
+    if cmp -s -- "$target" "$tracked"; then
+      if [[ $dry_run == false ]]; then
+        record_current_baseline "$rel" "$adapter" "$target" "$tracked" || return 1
+      fi
+      log_info "Already tracked: $(target_label_for "$rel")"
+      return 0
+    fi
+  else
+    original=$(original_path_for "$rel")
+    require_safe_regular "$original" "Omarchy original" || return 1
+    validate_markers "$target" "$adapter" || {
+      log_error "Malformed or nested Stomarchy markers: $target"
+      return 1
+    }
+    build_append_target "$original" "$adapter" "$tracked" desired || return 1
+    validate_assembled "$adapter" "$desired" || return 1
+
+    if cmp -s -- "$target" "$desired"; then
+      if [[ $dry_run == false ]]; then
+        record_current_baseline "$rel" "$adapter" "$target" "$tracked" "$original" || return 1
+      fi
+      log_info "Already managed: $(target_label_for "$rel")"
+      log_info "Edit the tracked tweak for further changes: $tracked"
+      return 0
+    fi
+  fi
+
+  if load_baseline "$rel"; then
+    current_hash=$(hash_file "$target") || return 1
+    if [[ $current_hash == "$BASELINE_TARGET" ]]; then
+      log_info "Managed target is unchanged; the tracked tweak or Omarchy baseline changed"
+      log_info "Edit the tweak directly, then run 'stomarchy link' or 'stomarchy sync'"
+      return 0
+    fi
+    if ! adapter_is_full_file "$adapter"; then
+      original_hash=$(hash_file "$original") || return 1
+      if [[ $original_hash != "$BASELINE_ORIGINAL" ]] && cmp -s -- "$target" "$original"; then
+        log_info "Omarchy replaced the managed target with a new upstream original"
+        log_info "The tracked tweak is intact; run 'stomarchy sync' to reattach it"
+        return 0
+      fi
+    fi
+  else
+    baseline_result=$?
+    if ((baseline_result == 2)); then
+      log_error "Invalid baseline state for: $(target_label_for "$rel")"
+      return 1
+    fi
+  fi
+
+  log_error "Managed target drift detected; add will not recalculate or overwrite either file"
+  log_error "Keep the target unchanged and edit the tracked tweak directly: $tracked"
+  return 1
+}
+
+cmd_add_file() {
+  local operand=$1
+  local dry_run=$2
+  local rel
+  local adapter
+  local target
+  local tracked
+  local original=""
+  local suffix=""
+  local desired=""
+  local validation_desired=""
+  local target_before_hash
+  local tweak_stage
+  local target_stage
+
+  rel=$(rel_from_target "$operand") || return 1
+  if ! adapter=$(adapter_for "$rel"); then
+    log_error "Unsupported config adapter: $(target_label_for "$rel")"
+    log_error "Supported: hypr/*.lua, ghostty/config, kitty/*.conf, tmux/*.conf, foot/*.ini, ~/.bashrc, ~/.inputrc, uwsm/default"
+    return 1
+  fi
+
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
+
+  require_safe_regular "$target" "Target" || return 1
+  is_safe_regular_or_missing "$tracked" "Tracked tweak" || return 1
+
+  if [[ -f $tracked ]]; then
+    add_existing "$rel" "$adapter" "$target" "$tracked" "$dry_run"
+    return
+  fi
+
+  if adapter_is_full_file "$adapter"; then
+    validate_tweak "$adapter" "$target" || return 1
+
+    if [[ $dry_run == true ]]; then
+      log_info "Dry run: no files changed"
+      log_info "Would store the complete user-owned file at: $tracked"
+      show_diff "$tracked" "$target" "$tracked"
+      return 0
+    fi
+
+    make_temp_beside tweak_stage "$tracked" || return 1
+    cp -p -- "$target" "$tweak_stage" || return 1
+    atomic_replace "$tweak_stage" "$tracked" || return 1
+    record_current_baseline "$rel" "$adapter" "$target" "$tracked" || return 1
+    log_success "Added full-file tracking: $(target_label_for "$rel")"
+    log_info "The target was left intact; edit the tracked copy from now on: $tracked"
+    return 0
+  fi
+
+  original=$(original_path_for "$rel")
+  require_safe_regular "$original" "Omarchy original" || return 1
+  validate_markers "$target" "$adapter" || {
+    log_error "Malformed or nested Stomarchy markers: $target"
+    return 1
+  }
+  if has_stomarchy_marker "$target" "$adapter"; then
+    log_error "Target already has a Stomarchy marker block, but its tracked tweak is missing"
+    log_error "Refusing to capture the managed block as a new tweak: $target"
+    return 1
+  fi
+
+  if ! extract_exact_suffix "$original" "$target" suffix; then
+    log_error "Changes are not append-only: the Omarchy original is not an exact byte prefix"
+    log_error "No target or tracked file was changed"
+    return 1
+  fi
+
+  validate_tweak "$adapter" "$suffix" || {
+    log_error "No target or tracked file was changed"
+    return 1
+  }
+
+  build_append_target "$original" "$adapter" "$tracked" desired || return 1
+
+  if [[ $adapter == "foot" ]]; then
+    build_append_target "$original" "$adapter" "$suffix" validation_desired || return 1
+    validate_assembled "$adapter" "$validation_desired" || {
+      log_error "No target or tracked file was changed"
+      return 1
+    }
+  else
+    validate_assembled "$adapter" "$desired" || {
+      log_error "No target or tracked file was changed"
+      return 1
+    }
+  fi
+
+  if [[ $dry_run == true ]]; then
+    log_info "Dry run: no files changed"
+    log_info "Would capture this exact EOF suffix in: $tracked"
+    if [[ -s $suffix ]]; then
+      printf '%s\n' "--- tweak ---"
+      sed -n '1,$p' "$suffix"
+      printf '%s\n' "--- end tweak ---"
+    else
+      printf '%s\n' "(empty no-op tweak)"
+    fi
+    log_info "Would restore the Omarchy original and append one import block to: $target"
+    return 0
+  fi
+
+  target_before_hash=$(hash_file "$target") || return 1
+
+  make_temp_beside tweak_stage "$tracked" || return 1
+  cp -p -- "$suffix" "$tweak_stage" || return 1
+
+  make_temp_beside target_stage "$target" || return 1
+  cp -p -- "$desired" "$target_stage" || return 1
+
+  if [[ $adapter == "foot" ]]; then
+    # The final include path does not exist until the tweak is installed. The
+    # equivalent assembled file above has already been checked by foot -C.
+    validate_markers "$target_stage" "$adapter" || return 1
+  else
+    validate_assembled "$adapter" "$target_stage" || return 1
+  fi
+
+  if [[ $(hash_file "$target") != "$target_before_hash" ]]; then
+    log_error "Target changed during add; refusing to commit staged files"
+    return 1
+  fi
+
+  atomic_replace "$tweak_stage" "$tracked" || return 1
+  if [[ $adapter == "foot" ]] && ! validate_assembled "$adapter" "$target_stage"; then
+    rm -f -- "$tracked"
+    log_error "No target file was changed"
+    return 1
+  fi
+  if ! atomic_replace "$target_stage" "$target"; then
+    rm -f -- "$tracked"
+    log_error "Failed to restore target; the new tracked tweak was rolled back"
+    return 1
+  fi
+
+  record_current_baseline "$rel" "$adapter" "$target" "$tracked" "$original" || return 1
+  log_success "Added: $(target_label_for "$rel")"
+  log_info "Captured the exact EOF suffix at: $tracked"
+  log_info "Edit that tracked tweak directly for future changes"
+}
+
+preflight_rels() {
+  local action=$1
+  local force=$2
+  local rel
+  local failed=0
+
+  for rel in "${RELS[@]}"; do
+    if ! preflight_tracked_rel "$rel" "$action" "$force"; then
+      failed=1
+    fi
+  done
+
+  ((failed == 0))
+}
+
+run_tracked_operation() {
+  local action=$1
+  local dry_run=$2
+  local force=$3
+  local rel
+  local failed=0
+  local completed=0
+
+  if ! preflight_rels "$action" "$force"; then
+    log_error "Preflight failed; no tracked targets were changed"
+    return 1
+  fi
+
+  if [[ $dry_run == false && $force == true ]]; then
+    ensure_recovery_dir || return 1
+    for rel in "${RELS[@]}"; do
+      snapshot_rel "$rel" || {
+        log_error "Recovery snapshot failed; no tracked targets were changed"
+        return 1
+      }
     done
+  fi
 
-    if [ "$dry_run" = true ]; then
-        log_info "Previewing sync from current Omarchy defaults..."
+  for rel in "${RELS[@]}"; do
+    if operate_tracked_rel "$rel" "$action" "$dry_run" "$force"; then
+      ((completed += 1))
     else
-        log_info "Syncing local targets from current Omarchy defaults..."
+      failed=1
     fi
-    init_dirs
+  done
 
-    if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
-        log_error "Omarchy config directory not found: $OMARCHY_CONFIG_DIR"
-        exit 1
-    fi
+  if ((failed != 0)); then
+    log_error "$action completed with failures"
+    return 1
+  fi
 
-    local files_synced=0
-    local files_unchanged=0
-    local imports_applied=0
-
-    while IFS= read -r -d '' original_file; do
-        local config_rel_path="${original_file#"$OMARCHY_CONFIG_DIR"/}"
-
-        SYNC_RESULT=""
-        write_synced_target "$config_rel_path" "$original_file" "$dry_run"
-
-        case "$SYNC_RESULT" in
-            synced|would_sync)
-                files_synced=$((files_synced + 1))
-                ;;
-            synced_import|would_sync_import)
-                files_synced=$((files_synced + 1))
-                imports_applied=$((imports_applied + 1))
-                ;;
-            unchanged)
-                files_unchanged=$((files_unchanged + 1))
-                ;;
-            unchanged_import)
-                files_unchanged=$((files_unchanged + 1))
-                imports_applied=$((imports_applied + 1))
-                ;;
-        esac
-    done < <(find "$OMARCHY_CONFIG_DIR" -type f -print0)
-
-    while IFS= read -r -d '' tracked_file; do
-        # Skip stomarchy internal files
-        local filename
-        filename=$(basename "$tracked_file")
-        if [[ "$filename" == .stomarchy-* ]]; then
-            continue
-        fi
-
-        local config_rel_path
-        if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
-            continue
-        fi
-
-        if [ ! -f "${OMARCHY_CONFIG_DIR}/${config_rel_path}" ]; then
-            log_warn "Tweak has no current Omarchy original, skipping: $tracked_file"
-        fi
-    done < <(find_tracked_files)
-
-    if [ "$dry_run" = true ]; then
-        log_success "Would sync $files_synced file(s), leave $files_unchanged unchanged, apply $imports_applied import block(s)"
-    else
-        log_success "Synced $files_synced file(s), left $files_unchanged unchanged, applied $imports_applied import block(s)"
-    fi
+  if [[ $dry_run == true ]]; then
+    log_success "Dry run complete: $completed tracked file(s), no files changed"
+  else
+    log_success "${action^} complete: $completed tracked file(s)"
+  fi
 }
 
-# Restore all local targets to current Omarchy baselines without tweak imports
-cmd_wipe() {
-    if [ $# -gt 0 ]; then
-        log_error "Usage: stomarchy wipe"
-        exit 1
+preflight_all_rel() {
+  local rel=$1
+  local action=$2
+  local original
+  local target
+  local tracked
+  local adapter=""
+  local desired
+
+  original=$(original_path_for "$rel")
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
+
+  is_safe_regular_or_missing "$target" "Target" || return 1
+
+  if [[ -e $tracked || -L $tracked ]]; then
+    require_safe_regular "$tracked" "Tracked tweak" || return 1
+    if ! adapter=$(adapter_for "$rel"); then
+      log_error "Unsupported tracked file blocks --all until migrated: $tracked"
+      return 1
     fi
-
-    log_info "Wiping Stomarchy imports from local targets..."
-
-    if [ ! -d "$OMARCHY_CONFIG_DIR" ]; then
-        log_error "Omarchy config directory not found: $OMARCHY_CONFIG_DIR"
-        exit 1
+    validate_tweak "$adapter" "$tracked" || return 1
+    if adapter_is_full_file "$adapter"; then
+      return 0
     fi
+  fi
 
-    local files_restored=0
-    local files_unchanged=0
+  require_safe_regular "$original" "Omarchy original" || return 1
+  make_temp desired || return 1
+  cp -p -- "$original" "$desired" || return 1
 
-    while IFS= read -r -d '' original_file; do
-        local config_rel_path="${original_file#"$OMARCHY_CONFIG_DIR"/}"
-        local target_file
-        target_file=$(get_target_path "$config_rel_path")
-
-        if [ -f "$target_file" ] && cmp -s "$target_file" "$original_file"; then
-            files_unchanged=$((files_unchanged + 1))
-        else
-            files_restored=$((files_restored + 1))
-        fi
-
-        restore_target_base "$config_rel_path" "$original_file"
-    done < <(find "$OMARCHY_CONFIG_DIR" -type f -print0)
-
-    log_success "Wiped $files_restored file(s), left $files_unchanged unchanged"
-    log_info "Tweaks were left intact in: $STOMARCHY_DIR"
+  if [[ $action == "sync" && -n $adapter && ! $adapter == full-* ]]; then
+    chmod u+w -- "$desired" || return 1
+    append_import_block "$desired" "$adapter" "$tracked" || return 1
+    chmod --reference="$original" -- "$desired" || return 1
+    validate_assembled "$adapter" "$desired" || return 1
+  fi
 }
 
-# Show status
-cmd_status() {
-    log_info "Stomarchy Status"
-    echo ""
-    
-    # Check stomarchy directory
-    if [ -d "$STOMARCHY_DIR" ]; then
-        log_success "Stomarchy directory: $STOMARCHY_DIR"
-    else
-        log_warn "Stomarchy directory not found: $STOMARCHY_DIR"
+operate_all_rel() {
+  local rel=$1
+  local action=$2
+  local dry_run=$3
+  local original
+  local target
+  local tracked
+  local adapter=""
+  local desired
+  local label
+
+  original=$(original_path_for "$rel")
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
+  label=$(target_label_for "$rel")
+
+  if [[ -f $tracked && ! -L $tracked ]]; then
+    adapter=$(adapter_for "$rel" || true)
+  fi
+
+  if [[ -n $adapter ]] && adapter_is_full_file "$adapter"; then
+    if [[ $action == "wipe" ]]; then
+      log_info "Left user-owned full file intact: $label"
+      return 0
     fi
-    
-    # Check Omarchy config mirror
-    echo ""
-    log_info "Omarchy Defaults:"
-    if [ -d "$OMARCHY_CONFIG_DIR" ]; then
-        echo "  Source: $OMARCHY_CONFIG_DIR"
-    else
-        echo "  Missing: $OMARCHY_CONFIG_DIR"
+
+    make_temp desired || return 1
+    cp -p -- "$tracked" "$desired" || return 1
+
+    if [[ $dry_run == true ]]; then
+      if cmp -s -- "$target" "$desired" 2>/dev/null; then
+        log_info "Would leave unchanged: $label"
+      else
+        log_info "Would update under --all --force: $label"
+        show_diff "$target" "$desired" "$label"
+      fi
+      return 0
     fi
-    
-    # List tweaks
-    echo ""
-    log_info "Tweaks:"
-    if [ -d "$STOMARCHY_DIR" ]; then
-        local file_count=0
-        while IFS= read -r -d '' tracked_file; do
-            local filename
-            local status_tags=""
-            filename=$(basename "$tracked_file")
-            # Skip stomarchy internal files
-            if [[ "$filename" == .stomarchy-* ]]; then
-                continue
-            fi
-            
-            local config_rel_path
-            if ! config_rel_path=$(get_config_rel_path_from_tracked "$tracked_file"); then
-                continue
-            fi
 
-            local target_file
-            local original_file
-            local supported=true
-            local original_present=true
-            local import_directive=""
-            target_file=$(get_target_path "$config_rel_path")
-            original_file=$(get_omarchy_original_path "$config_rel_path")
-
-            if ! is_supported_config "$config_rel_path"; then
-                supported=false
-                status_tags=$(append_tag "$status_tags" "unsupported")
-            fi
-
-            if [ ! -f "$original_file" ]; then
-                original_present=false
-                status_tags=$(append_tag "$status_tags" "missing-original")
-            fi
-
-            if [ ! -s "$tracked_file" ]; then
-                status_tags=$(append_tag "$status_tags" "no-op")
-            fi
-
-            if [ "$supported" = true ]; then
-                import_directive=$(get_import_directive "$config_rel_path" "$tracked_file" || true)
-            fi
-
-            if [ -n "$import_directive" ] && [ -f "$target_file" ] && grep -Fq -- "$import_directive" "$target_file"; then
-                status_tags=$(append_tag "$status_tags" "linked")
-            else
-                status_tags=$(append_tag "$status_tags" "unlinked")
-            fi
-
-            if [ "$supported" = true ] && [ "$original_present" = true ]; then
-                local desired_file
-                desired_file=$(mktemp)
-                cp -p "$original_file" "$desired_file"
-                append_import_block "$desired_file" "$config_rel_path" "$import_directive"
-
-                if [ ! -f "$target_file" ] || ! cmp -s "$target_file" "$desired_file"; then
-                    status_tags=$(append_tag "$status_tags" "stale")
-                fi
-
-                rm -f "$desired_file"
-            fi
-
-            echo "  $(format_target_label "$config_rel_path") [${status_tags}]"
-            echo "    Tweak: $tracked_file"
-            file_count=$((file_count + 1))
-        done < <(find_tracked_files)
-        
-        if [ "$file_count" -eq 0 ]; then
-            echo "  (none)"
-        else
-            echo ""
-            echo "  Total: $file_count tweak(s)"
-        fi
-    else
-        echo "  (none)"
+    if ! cmp -s -- "$target" "$desired" 2>/dev/null; then
+      stage_and_replace "$desired" "$target" "$adapter" || return 1
     fi
+    record_current_baseline "$rel" "$adapter" "$target" "$tracked" || return 1
+    return 0
+  fi
+
+  make_temp desired || return 1
+  cp -p -- "$original" "$desired" || return 1
+  if [[ $action == "sync" && -n $adapter && ! $adapter == full-* ]]; then
+    chmod u+w -- "$desired" || return 1
+    append_import_block "$desired" "$adapter" "$tracked" || return 1
+    chmod --reference="$original" -- "$desired" || return 1
+  fi
+
+  if [[ $dry_run == true ]]; then
+    if cmp -s -- "$target" "$desired" 2>/dev/null; then
+      log_info "Would leave unchanged: $label"
+    else
+      log_info "Would update under --all --force: $label"
+      show_diff "$target" "$desired" "$label"
+    fi
+    return 0
+  fi
+
+  if ! cmp -s -- "$target" "$desired" 2>/dev/null; then
+    snapshot_rel "$rel" || return 1
+    stage_and_replace "$desired" "$target" "$adapter" || return 1
+  fi
+
+  if [[ -n $adapter ]]; then
+    record_current_baseline "$rel" "$adapter" "$target" "$tracked" "$original" || return 1
+  fi
 }
 
-# Show help
-cmd_help() {
-    cat << EOF
-stomarchy v${VERSION}
-Save and restore your Omarchy config without disrupting its opinionated design
+run_all_operation() {
+  local action=$1
+  local dry_run=$2
+  local rel
+  local failed=0
+  local completed=0
 
-USAGE:
-    stomarchy [COMMAND] [OPTIONS]
+  collect_all_rels || return 1
 
-COMMANDS:
-    add [--dry-run] <file>
-                        Track diff-only changes and update the local file
-    link [file]         Link checked-out tweaks into local files
-    remove <file>       Stop tracking a file and restore Omarchy defaults
-    sync [--dry-run]    Copy current Omarchy defaults into local files
-    wipe                Restore all local targets to Omarchy baselines
-    status              Show current status and tweaks
-    help                Show this help message
+  for rel in "${RELS[@]}"; do
+    if ! preflight_all_rel "$rel" "$action"; then
+      failed=1
+    fi
+  done
 
-EXAMPLES:
-    # Track diff-only changes and update the local file
-    stomarchy add --dry-run ~/.config/hypr/hyprland.conf
-    stomarchy add ~/.config/hypr/hyprland.conf
-    stomarchy add ~/.bashrc
-    stomarchy add ~/.inputrc
+  if ((failed != 0)); then
+    log_error "Preflight failed; no mirror targets were changed"
+    return 1
+  fi
 
-    # Link checked-out tweaks into local files
-    stomarchy link
+  if [[ $dry_run == false ]]; then
+    ensure_recovery_dir || return 1
+    for rel in "${RELS[@]}"; do
+      snapshot_rel "$rel" || {
+        log_error "Recovery snapshot failed; no mirror targets were changed"
+        return 1
+      }
+    done
+  fi
 
-    # Stop tracking a file and restore the Omarchy default
-    stomarchy remove ~/.config/hypr/hyprland.conf
+  for rel in "${RELS[@]}"; do
+    if operate_all_rel "$rel" "$action" "$dry_run"; then
+      ((completed += 1))
+    else
+      failed=1
+    fi
+  done
 
-    # Preview or sync current Omarchy defaults into local files
-    stomarchy sync --dry-run
-    stomarchy sync
+  if ((failed != 0)); then
+    log_error "$action --all completed with failures"
+    return 1
+  fi
 
-    # Restore all local targets to Omarchy baselines
-    stomarchy wipe
+  if [[ $dry_run == true ]]; then
+    log_success "Dry run complete: $completed mirror file(s), no files changed"
+  else
+    log_success "${action^} --all complete: $completed mirror file(s)"
+  fi
+}
 
-    # View status
-    stomarchy status
+usage_add() {
+  cat <<'EOF'
+Usage: stomarchy add [-n|--dry-run] FILE
 
-DIRECTORY STRUCTURE:
-    Diff-only tweaks are tracked under ~/.config/stomarchy/:
-
-    ~/.config/                      ~/.config/stomarchy/
-    ├── hypr/                       ├── .config/
-    │   ├── hyprland.conf           │   └── hypr/
-    │   └── hyprland.lua            │       ├── hyprland.conf
-    │                               │       └── hyprland.lua
-    ~/.bashrc                       ├── .bashrc
-    ~/.inputrc                      └── .inputrc
-
-    Use git to version control your ~/.config/stomarchy/ directory.
-
-DIRECTORIES:
-    Config:     ${STOMARCHY_DIR}
-    Omarchy:    ${OMARCHY_CONFIG_DIR}
-
-For more information, visit: https://github.com/brianblakely/stomarchy
+Capture only an exact suffix appended to an Omarchy original. Full-file
+adapters (.inputrc and uwsm/default) store the complete user-owned file.
+--preview is accepted as a deprecated alias for --dry-run.
 EOF
 }
 
-# Main command dispatcher
-main() {
-    local command="${1:-help}"
-    
-    case "$command" in
-        add)
-            shift
-            cmd_add "$@"
-            ;;
-        link)
-            shift
-            cmd_link "$@"
-            ;;
-        remove)
-            shift
-            cmd_remove "$@"
-            ;;
-        sync)
-            shift
-            cmd_sync "$@"
-            ;;
-        wipe)
-            shift
-            cmd_wipe "$@"
-            ;;
-        status)
-            cmd_status
-            ;;
-        help|--help|-h)
-            cmd_help
-            ;;
-        --version|-v)
-            echo "stomarchy v${VERSION}"
-            ;;
+usage_link() {
+  cat <<'EOF'
+Usage: stomarchy link [-n|--dry-run] [--force] [FILE]
+
+Assemble tracked tweaks into one target or every tracked target. Target drift
+is refused unless --force is used; forced writes create a recovery snapshot.
+EOF
+}
+
+usage_remove() {
+  cat <<'EOF'
+Usage: stomarchy remove [-n|--dry-run] [--force] [FILE]
+
+Restore append-only targets before deleting their tweaks. Full-file targets
+are left intact. With no FILE, remove every tracked tweak.
+EOF
+}
+
+usage_sync() {
+  cat <<'EOF'
+Usage: stomarchy sync [-n|--dry-run] [--all] [--force]
+
+Refresh tracked targets from current Omarchy originals. --all covers the full
+Quattro config mirror and requires --force.
+EOF
+}
+
+usage_wipe() {
+  cat <<'EOF'
+Usage: stomarchy wipe [-n|--dry-run] [--all] [--force]
+
+Remove imports from tracked append-only targets without deleting tweaks.
+User-owned full files are left intact. --all requires --force.
+EOF
+}
+
+usage_status() {
+  cat <<'EOF'
+Usage: stomarchy status [--check] [--porcelain]
+
+Show deterministic health tags. --check exits nonzero when an actionable
+problem is present; --porcelain prints TARGET<TAB>TAGS.
+EOF
+}
+
+usage_main() {
+  cat <<EOF
+stomarchy v$VERSION
+Safely preserve append-only Omarchy Quattro customizations.
+
+Usage:
+  stomarchy COMMAND [OPTIONS]
+
+Commands:
+  add [-n|--dry-run] FILE
+  link [-n|--dry-run] [--force] [FILE]
+  remove [-n|--dry-run] [--force] [FILE]
+  sync [-n|--dry-run] [--all] [--force]
+  wipe [-n|--dry-run] [--all] [--force]
+  status [--check] [--porcelain]
+  help [COMMAND]
+
+Adapters:
+  Append-only: hypr/*.lua, ghostty/config, kitty/*.conf, tmux/*.conf,
+               foot/*.ini, ~/.bashrc
+  Full-file:   ~/.inputrc, ~/.config/uwsm/default
+  Refused:     hypr/*.conf, uwsm/env, arbitrary *.sh, unregistered formats
+
+Global options:
+  -h, --help
+  -v, --version
+
+Safety:
+  add accepts only an exact EOF suffix. After the first add, edit the tracked
+  tweak and run link. sync and wipe are tracked-only unless --all --force is
+  explicit. Forced replacements create recovery snapshots in the state path.
+
+Environment:
+  STOMARCHY_OMARCHY_ROOT, OMARCHY_PATH, STOMARCHY_OMARCHY_CONFIG_DIR
+  XDG_CONFIG_HOME (repository only), XDG_STATE_HOME, NO_COLOR
+
+Exit status: 0 success, 1 operational/check failure, 2 usage error
+
+Storage:  $STOMARCHY_DIR
+State:    $STATE_DIR
+Omarchy:  $OMARCHY_ROOT
+Targets:  $TARGET_CONFIG_HOME
+EOF
+}
+
+usage_error() {
+  log_error "$1"
+  return 2
+}
+
+parse_preview() {
+  log_warn "--preview is deprecated; use --dry-run"
+}
+
+cmd_add() {
+  local dry_run=false
+  local help=false
+  local parse_options=true
+  local arg
+  local -a operands=()
+
+  for arg in "$@"; do
+    if [[ $parse_options == true ]]; then
+      case "$arg" in
+        --)
+          parse_options=false
+          ;;
+        -n|--dry-run)
+          dry_run=true
+          ;;
+        --preview)
+          dry_run=true
+          parse_preview
+          ;;
+        -h|--help)
+          help=true
+          ;;
+        -*)
+          usage_error "Unknown add option: $arg"
+          return
+          ;;
         *)
-            log_error "Unknown command: $command"
-            echo ""
-            cmd_help
-            exit 1
-            ;;
-    esac
+          operands+=("$arg")
+          ;;
+      esac
+    else
+      operands+=("$arg")
+    fi
+  done
+
+  if [[ $help == true ]]; then
+    usage_add
+    return 0
+  fi
+  if ((${#operands[@]} != 1)); then
+    usage_add >&2
+    usage_error "add requires exactly one FILE"
+    return
+  fi
+
+  if [[ $dry_run == false ]]; then
+    acquire_lock || return 1
+  fi
+  cmd_add_file "${operands[0]}" "$dry_run"
+}
+
+parse_file_operation() {
+  local command=$1
+  shift
+  local arg
+
+  PARSED_DRY=false
+  PARSED_FORCE=false
+  PARSED_HELP=false
+  PARSED_OPERANDS=()
+  local parse_options=true
+
+  for arg in "$@"; do
+    if [[ $parse_options == true ]]; then
+      case "$arg" in
+        --)
+          parse_options=false
+          ;;
+        -n|--dry-run)
+          PARSED_DRY=true
+          ;;
+        --preview)
+          PARSED_DRY=true
+          parse_preview
+          ;;
+        --force)
+          PARSED_FORCE=true
+          ;;
+        -h|--help)
+          PARSED_HELP=true
+          ;;
+        -*)
+          usage_error "Unknown $command option: $arg"
+          return
+          ;;
+        *)
+          PARSED_OPERANDS+=("$arg")
+          ;;
+      esac
+    else
+      PARSED_OPERANDS+=("$arg")
+    fi
+  done
+
+  if ((${#PARSED_OPERANDS[@]} > 1)); then
+    usage_error "$command accepts at most one FILE"
+    return
+  fi
+}
+
+cmd_file_operation() {
+  local action=$1
+  shift
+  local rel
+  local tracked
+
+  parse_file_operation "$action" "$@" || return
+  if [[ $PARSED_HELP == true ]]; then
+    "usage_$action"
+    return 0
+  fi
+
+  RELS=()
+  if ((${#PARSED_OPERANDS[@]} == 1)); then
+    rel=$(rel_from_operand "${PARSED_OPERANDS[0]}") || return 1
+    tracked=$(tracked_path_for "$rel")
+    require_safe_regular "$tracked" "Tracked tweak" || return 1
+    RELS+=("$rel")
+  else
+    collect_tracked_rels
+  fi
+
+  if ((${#RELS[@]} == 0)); then
+    log_warn "No tracked tweaks found"
+    return 0
+  fi
+
+  if [[ $PARSED_DRY == false ]]; then
+    acquire_lock || return 1
+  fi
+  run_tracked_operation "$action" "$PARSED_DRY" "$PARSED_FORCE"
+}
+
+parse_reset_operation() {
+  local command=$1
+  shift
+  local arg
+  local parse_options=true
+
+  PARSED_DRY=false
+  PARSED_FORCE=false
+  PARSED_ALL=false
+  PARSED_HELP=false
+  PARSED_OPERANDS=()
+
+  for arg in "$@"; do
+    if [[ $parse_options == true ]]; then
+      case "$arg" in
+        --)
+          parse_options=false
+          ;;
+        -n|--dry-run)
+          PARSED_DRY=true
+          ;;
+        --preview)
+          PARSED_DRY=true
+          parse_preview
+          ;;
+        --force)
+          PARSED_FORCE=true
+          ;;
+        --all)
+          PARSED_ALL=true
+          ;;
+        -h|--help)
+          PARSED_HELP=true
+          ;;
+        -*)
+          usage_error "Unknown $command option: $arg"
+          return
+          ;;
+        *)
+          PARSED_OPERANDS+=("$arg")
+          ;;
+      esac
+    else
+      PARSED_OPERANDS+=("$arg")
+    fi
+  done
+
+  if ((${#PARSED_OPERANDS[@]} != 0)); then
+    usage_error "$command does not accept operands"
+    return
+  fi
+
+  if [[ $PARSED_ALL == true && $PARSED_FORCE != true ]]; then
+    usage_error "$command --all requires --force"
+    return
+  fi
+}
+
+cmd_reset_operation() {
+  local action=$1
+  shift
+
+  parse_reset_operation "$action" "$@" || return
+  if [[ $PARSED_HELP == true ]]; then
+    "usage_$action"
+    return 0
+  fi
+
+  if [[ $PARSED_DRY == false ]]; then
+    acquire_lock || return 1
+  fi
+
+  if [[ $PARSED_ALL == true ]]; then
+    run_all_operation "$action" "$PARSED_DRY"
+  else
+    collect_tracked_rels
+    if ((${#RELS[@]} == 0)); then
+      log_warn "No tracked tweaks found"
+      return 0
+    fi
+    run_tracked_operation "$action" "$PARSED_DRY" "$PARSED_FORCE"
+  fi
+}
+
+append_status_tag() {
+  local current=$1
+  local tag=$2
+
+  if [[ -n $current ]]; then
+    printf '%s,%s\n' "$current" "$tag"
+  else
+    printf '%s\n' "$tag"
+  fi
+}
+
+status_for_rel() {
+  local rel=$1
+  local adapter
+  local target
+  local tracked
+  local original=""
+  local desired=""
+  local tags=""
+  local current_hash
+  local original_hash
+  local tweak_hash
+  local baseline_result
+  local actionable=false
+
+  target=$(target_path_for "$rel")
+  tracked=$(tracked_path_for "$rel")
+
+  if [[ -L $tracked || ! -f $tracked ]]; then
+    tags=$(append_status_tag "$tags" "unsafe-tweak")
+    actionable=true
+  elif ! adapter=$(adapter_for "$rel"); then
+    tags=$(append_status_tag "$tags" "unsupported")
+    actionable=true
+  else
+    if [[ ! -s $tracked && ! $adapter == full-* ]]; then
+      tags=$(append_status_tag "$tags" "no-op")
+    fi
+
+    if ! validate_tweak "$adapter" "$tracked" true; then
+      tags=$(append_status_tag "$tags" "invalid-tweak")
+      actionable=true
+    fi
+
+    if [[ -L $target || ( -e $target && ! -f $target ) ]]; then
+      tags=$(append_status_tag "$tags" "unsafe-target")
+      actionable=true
+    elif [[ ! -f $target ]]; then
+      tags=$(append_status_tag "$tags" "missing-target")
+      actionable=true
+    elif adapter_is_full_file "$adapter"; then
+      if cmp -s -- "$target" "$tracked"; then
+        tags=$(append_status_tag "$tags" "linked")
+      elif load_baseline "$rel"; then
+        current_hash=$(hash_file "$target")
+        tweak_hash=$(hash_file "$tracked")
+        if [[ $current_hash == "$BASELINE_TARGET" && $tweak_hash != "$BASELINE_TWEAK" ]]; then
+          tags=$(append_status_tag "$tags" "tweak-changed")
+        else
+          tags=$(append_status_tag "$tags" "drift")
+        fi
+        actionable=true
+      else
+        baseline_result=$?
+        if ((baseline_result == 2)); then
+          tags=$(append_status_tag "$tags" "invalid-baseline")
+        else
+          tags=$(append_status_tag "$tags" "unlinked")
+        fi
+        actionable=true
+      fi
+    else
+      original=$(original_path_for "$rel")
+      if [[ -L $original || ! -f $original ]]; then
+        tags=$(append_status_tag "$tags" "missing-original")
+        actionable=true
+      elif ! validate_markers "$target" "$adapter"; then
+        tags=$(append_status_tag "$tags" "malformed-markers")
+        actionable=true
+      elif ! build_append_target "$original" "$adapter" "$tracked" desired ||
+          ! validate_assembled "$adapter" "$desired" true; then
+        tags=$(append_status_tag "$tags" "invalid-target")
+        actionable=true
+      elif cmp -s -- "$target" "$desired"; then
+        tags=$(append_status_tag "$tags" "linked")
+      elif load_baseline "$rel"; then
+        current_hash=$(hash_file "$target")
+        original_hash=$(hash_file "$original")
+        tweak_hash=$(hash_file "$tracked")
+        if [[ $original_hash != "$BASELINE_ORIGINAL" ]] && cmp -s -- "$target" "$original"; then
+          tags=$(append_status_tag "$tags" "upstream-changed")
+        elif [[ $current_hash != "$BASELINE_TARGET" ]]; then
+          tags=$(append_status_tag "$tags" "drift")
+        elif [[ $original_hash != "$BASELINE_ORIGINAL" ]]; then
+          tags=$(append_status_tag "$tags" "upstream-changed")
+        elif [[ $tweak_hash != "$BASELINE_TWEAK" ]]; then
+          tags=$(append_status_tag "$tags" "tweak-changed")
+        else
+          tags=$(append_status_tag "$tags" "stale")
+        fi
+        actionable=true
+      else
+        baseline_result=$?
+        if ((baseline_result == 2)); then
+          tags=$(append_status_tag "$tags" "invalid-baseline")
+        elif cmp -s -- "$target" "$original"; then
+          tags=$(append_status_tag "$tags" "unlinked")
+        else
+          tags=$(append_status_tag "$tags" "drift")
+        fi
+        actionable=true
+      fi
+    fi
+  fi
+
+  STATUS_TAGS=$tags
+  STATUS_ACTIONABLE=$actionable
+}
+
+cmd_status() {
+  local check=false
+  local porcelain=false
+  local help=false
+  local parse_options=true
+  local arg
+  local rel
+  local label
+  local problems=0
+  local -a operands=()
+
+  for arg in "$@"; do
+    if [[ $parse_options == true ]]; then
+      case "$arg" in
+        --)
+          parse_options=false
+          ;;
+        --check)
+          check=true
+          ;;
+        --porcelain)
+          porcelain=true
+          ;;
+        -h|--help)
+          help=true
+          ;;
+        -*)
+          usage_error "Unknown status option: $arg"
+          return
+          ;;
+        *)
+          operands+=("$arg")
+          ;;
+      esac
+    else
+      operands+=("$arg")
+    fi
+  done
+
+  if [[ $help == true ]]; then
+    usage_status
+    return 0
+  fi
+  if ((${#operands[@]} != 0)); then
+    usage_status >&2
+    usage_error "status does not accept operands"
+    return
+  fi
+
+  collect_tracked_rels
+
+  if [[ $porcelain != true ]]; then
+    printf 'Stomarchy %s\n' "$VERSION"
+    printf 'Storage: %s\n' "$STOMARCHY_DIR"
+    printf 'State: %s\n' "$STATE_DIR"
+    printf 'Omarchy: %s\n' "$OMARCHY_ROOT"
+    printf 'Targets: %s\n' "$TARGET_CONFIG_HOME"
+  fi
+
+  if ((${#RELS[@]} == 0)); then
+    [[ $porcelain == true ]] || printf 'Tweaks: (none)\n'
+    return 0
+  fi
+
+  for rel in "${RELS[@]}"; do
+    status_for_rel "$rel"
+    label=$(target_label_for "$rel")
+    if [[ $STATUS_ACTIONABLE == true ]]; then
+      ((problems += 1))
+    fi
+
+    if [[ $porcelain == true ]]; then
+      printf '%s\t%s\n' "$label" "$STATUS_TAGS"
+    else
+      printf '  %s [%s]\n' "$label" "$STATUS_TAGS"
+      printf '    Tweak: %s\n' "$(tracked_path_for "$rel")"
+    fi
+  done
+
+  if [[ $check == true && $problems -gt 0 ]]; then
+    return 1
+  fi
+}
+
+cmd_help() {
+  local command=${1:-}
+
+  if (($# > 1)); then
+    usage_error "help accepts at most one COMMAND"
+    return
+  fi
+
+  case "$command" in
+    "")
+      usage_main
+      ;;
+    add|link|remove|sync|wipe|status)
+      "usage_$command"
+      ;;
+    *)
+      usage_error "Unknown command for help: $command"
+      ;;
+  esac
+}
+
+main() {
+  local command=${1:-help}
+
+  if (($# > 0)); then
+    shift
+  fi
+
+  case "$command" in
+    add)
+      cmd_add "$@"
+      ;;
+    link)
+      cmd_file_operation link "$@"
+      ;;
+    remove)
+      cmd_file_operation remove "$@"
+      ;;
+    sync)
+      cmd_reset_operation sync "$@"
+      ;;
+    wipe)
+      cmd_reset_operation wipe "$@"
+      ;;
+    status)
+      cmd_status "$@"
+      ;;
+    help)
+      cmd_help "$@"
+      ;;
+    -h|--help)
+      if (($# > 0)); then
+        usage_error "--help does not accept operands"
+      else
+        usage_main
+      fi
+      ;;
+    -v|--version)
+      if (($# > 0)); then
+        usage_error "--version does not accept operands"
+      else
+        printf 'stomarchy %s\n' "$VERSION"
+      fi
+      ;;
+    *)
+      log_error "Unknown command: $command"
+      usage_main >&2
+      return 2
+      ;;
+  esac
 }
 
 main "$@"

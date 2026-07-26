@@ -1,722 +1,748 @@
 #!/bin/bash
+# shellcheck disable=SC2030,SC2031
 
-set -euo pipefail
+set -uo pipefail
 
-ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SCRIPT="${ROOT_DIR}/stomarchy"
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+SCRIPT="$ROOT_DIR/stomarchy"
 PASS_COUNT=0
 FAIL_COUNT=0
 
 fail() {
-    echo "FAIL: $1" >&2
-    exit 1
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
 }
 
-assert_file_contains() {
-    local file="$1"
-    local expected="$2"
+assert_eq() {
+  local expected=$1
+  local actual=$2
+  local message=${3:-"values differ"}
 
-    grep -Fq -- "$expected" "$file" || fail "Expected ${file} to contain: ${expected}"
-}
-
-assert_file_not_contains() {
-    local file="$1"
-    local unexpected="$2"
-
-    if grep -Fq -- "$unexpected" "$file"; then
-        fail "Expected ${file} not to contain: ${unexpected}"
-    fi
+  [[ $actual == "$expected" ]] || fail "$message (expected '$expected', got '$actual')"
 }
 
 assert_file_exists() {
-    local file="$1"
-
-    [ -f "$file" ] || fail "Expected file to exist: $file"
+  [[ -f $1 ]] || fail "Expected regular file: $1"
 }
 
-assert_file_not_exists() {
-    local file="$1"
-
-    [ ! -e "$file" ] || fail "Expected file not to exist: $file"
+assert_not_exists() {
+  [[ ! -e $1 && ! -L $1 ]] || fail "Expected path not to exist: $1"
 }
 
-assert_empty_file() {
-    local file="$1"
+assert_contains() {
+  local file=$1
+  local text=$2
 
-    assert_file_exists "$file"
-    [ ! -s "$file" ] || fail "Expected file to be empty: $file"
+  grep -Fq -- "$text" "$file" || fail "Expected $file to contain: $text"
 }
 
-assert_no_backup_files() {
-    [ -z "$(find "$HOME" -name '*.stomarchy-backup.*' -print -quit)" ] || fail "Expected no backup files"
+assert_not_contains() {
+  local file=$1
+  local text=$2
+
+  if grep -Fq -- "$text" "$file"; then
+    fail "Expected $file not to contain: $text"
+  fi
 }
 
-with_temp_home() {
-    local name="$1"
-    shift
-    local tmp_dir
+assert_same() {
+  cmp -s -- "$1" "$2" || fail "Expected files to match: $1 and $2"
+}
 
-    tmp_dir=$(mktemp -d)
+assert_status() {
+  local expected=$1
+  shift
+  local actual
 
-    if (
-        export HOME="${tmp_dir}/home"
-        export XDG_CONFIG_HOME="${HOME}/.config"
-        export STOMARCHY_OMARCHY_CONFIG_DIR="${tmp_dir}/omarchy/config"
-        mkdir -p "$XDG_CONFIG_HOME" "$STOMARCHY_OMARCHY_CONFIG_DIR"
-        cd "$tmp_dir"
-        "$@"
-    ); then
-        echo "ok - ${name}"
-        PASS_COUNT=$((PASS_COUNT + 1))
-    else
-        echo "not ok - ${name}" >&2
-        FAIL_COUNT=$((FAIL_COUNT + 1))
+  set +e
+  "$@"
+  actual=$?
+  set -e
+  assert_eq "$expected" "$actual" "unexpected exit status for: $*"
+}
+
+run_stomarchy() {
+  "$SCRIPT" "$@"
+}
+
+with_fixture() {
+  local name=$1
+  local test_function=$2
+  local fixture
+  local fixture_status
+
+  fixture=$(mktemp -d)
+
+  set +e
+  (
+    set -euo pipefail
+    export TEST_ROOT="$fixture"
+    export HOME="$fixture/home"
+    export XDG_CONFIG_HOME="$fixture/xdg"
+    export XDG_STATE_HOME="$fixture/state"
+    export STOMARCHY_OMARCHY_ROOT="$fixture/omarchy"
+    unset OMARCHY_PATH STOMARCHY_OMARCHY_CONFIG_DIR NO_COLOR
+    mkdir -p "$HOME/.config" "$STOMARCHY_OMARCHY_ROOT/config" "$STOMARCHY_OMARCHY_ROOT/default"
+    cd "$fixture"
+    "$test_function"
+  )
+  fixture_status=$?
+  set -e
+
+  if ((fixture_status == 0)); then
+    printf 'ok - %s\n' "$name"
+    ((PASS_COUNT += 1))
+  else
+    printf 'not ok - %s\n' "$name" >&2
+    ((FAIL_COUNT += 1))
+  fi
+
+  rm -rf -- "$fixture"
+}
+
+test_quattro_root_xdg_and_multiline_lua() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/hypr/bindings.lua"
+  local target="$HOME/.config/hypr/bindings.lua"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/hypr/bindings.lua"
+  local expected="$TEST_ROOT/expected.lua"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'hl.bind("SUPER, Q", function() hl.killactive() end)\n' >"$original"
+  cp "$original" "$target"
+  {
+    printf 'hl.bind({\n'
+    printf '  mods = { "SUPER", "SHIFT" },\n'
+    printf '  key = "B",\n'
+    printf '}, function()\n'
+    printf '  hl.spawn("zen-browser")\n'
+    printf 'end)\n'
+  } >"$expected"
+  cat "$expected" >>"$target"
+
+  STOMARCHY_OMARCHY_ROOT="$STOMARCHY_OMARCHY_ROOT///" \
+    run_stomarchy add "$target" --dry-run >dry.log
+  assert_not_exists "$tracked"
+  assert_not_exists "$XDG_STATE_HOME"
+
+  STOMARCHY_OMARCHY_ROOT="$STOMARCHY_OMARCHY_ROOT///" \
+    run_stomarchy add "$target"
+
+  assert_same "$expected" "$tracked"
+  assert_contains "$target" "-- BEGIN Stomarchy tweaks"
+  assert_contains "$target" "dofile(\"$tracked\")"
+  luac -p "$tracked"
+  luac -p "$target"
+  run_stomarchy status --check --porcelain >status.log
+  assert_contains status.log $'~/.config/hypr/bindings.lua\tlinked'
+}
+
+test_in_place_edit_is_lossless_failure() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+  local before
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 11\n' >"$target"
+  before=$(sha256sum "$target")
+
+  assert_status 1 run_stomarchy add "$target" >out.log 2>err.log
+  assert_eq "$before" "$(sha256sum "$target")" "target changed after rejected add"
+  assert_not_exists "$tracked"
+  assert_contains err.log "not append-only"
+}
+
+test_managed_target_drift_preserves_both_files() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+  local target_hash
+  local tracked_hash
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 9\nfont-size = 11\n' >"$target"
+  run_stomarchy add "$target"
+
+  printf '\n# direct target edit\n' >>"$target"
+  target_hash=$(sha256sum "$target")
+  tracked_hash=$(sha256sum "$tracked")
+
+  assert_status 1 run_stomarchy add "$target" >out.log 2>err.log
+  assert_eq "$target_hash" "$(sha256sum "$target")" "drifted target changed"
+  assert_eq "$tracked_hash" "$(sha256sum "$tracked")" "tracked tweak changed"
+  assert_contains err.log "Managed target drift"
+  assert_status 1 run_stomarchy status --check --porcelain >status.log
+  assert_contains status.log "drift"
+}
+
+test_bashrc_mapping_multiline_and_injection_path() {
+  local original="$STOMARCHY_OMARCHY_ROOT/default/bashrc"
+  local target="$HOME/.bashrc"
+  local special_xdg="$TEST_ROOT/xdg space ' \$(touch SHOULD_NOT_EXIST) \`touch ALSO_NOT\`"
+  local tracked
+
+  export XDG_CONFIG_HOME="$special_xdg"
+  tracked="$XDG_CONFIG_HOME/stomarchy/.bashrc"
+
+  printf 'BASE_VALUE=quattro\n' >"$original"
+  cp "$original" "$target"
+  {
+    printf 'my_project() {\n'
+    # shellcheck disable=SC2016
+    printf '  printf "hello %%s\\n" "$BASE_VALUE"\n'
+    printf '}\n'
+  } >>"$target"
+
+  run_stomarchy add "$target"
+  assert_file_exists "$tracked"
+  assert_contains "$target" "source "
+  bash -n "$target"
+  bash --noprofile --norc -c 'source "$1"; my_project' _ "$target" >result.log
+  assert_contains result.log "hello quattro"
+  assert_not_exists "$TEST_ROOT/SHOULD_NOT_EXIST"
+  assert_not_exists "$TEST_ROOT/ALSO_NOT"
+}
+
+test_registry_path_quoting_keeps_metacharacters_literal() {
+  local special_xdg="$TEST_ROOT/registry space'\" \$(touch PWN) \`touch PWN2\`"
+  local rel
+  local original
+  local target
+
+  export XDG_CONFIG_HOME="$special_xdg"
+
+  for rel in hypr/paths.lua ghostty/config kitty/kitty.conf tmux/tmux.conf foot/foot.ini; do
+    original="$STOMARCHY_OMARCHY_ROOT/config/$rel"
+    target="$HOME/.config/$rel"
+    mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+
+    case "$rel" in
+      hypr/*.lua)
+        printf 'o.general.gaps_in = 5\n' >"$original"
+        printf 'o.general.gaps_in = 5\no.general.gaps_out = 8\n' >"$target"
+        ;;
+      ghostty/config)
+        printf 'font-size = 9\n' >"$original"
+        printf 'font-size = 9\nfont-size = 11\n' >"$target"
+        ;;
+      kitty/*.conf)
+        printf 'font_size 9\n' >"$original"
+        printf 'font_size 9\nfont_size 11\n' >"$target"
+        ;;
+      tmux/*.conf)
+        printf 'set -g status on\n' >"$original"
+        printf 'set -g status on\nset -g status off\n' >"$target"
+        ;;
+      foot/*.ini)
+        printf '[main]\nfont=monospace:size=9\n' >"$original"
+        printf '[main]\nfont=monospace:size=9\nfont=monospace:size=11\n' >"$target"
+        ;;
+    esac
+
+    run_stomarchy add "$target"
+    assert_contains "$target" "touch PWN"
+  done
+
+  luac -p "$HOME/.config/hypr/paths.lua"
+  foot -C -c "$HOME/.config/foot/foot.ini"
+  assert_not_exists "$TEST_ROOT/PWN"
+  assert_not_exists "$TEST_ROOT/PWN2"
+}
+
+test_foot_reopens_main_and_validates() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/foot/foot.ini"
+  local target="$HOME/.config/foot/foot.ini"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/foot/foot.ini"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  {
+    printf '[main]\n'
+    printf 'font=monospace:size=9\n'
+    printf '\n[scrollback]\n'
+    printf 'lines=1000\n'
+  } >"$original"
+  cp "$original" "$target"
+  printf '\n[colors-dark]\nalpha=0.95\n' >>"$target"
+
+  run_stomarchy add "$target"
+  assert_contains "$target" "# BEGIN Stomarchy tweaks"
+  assert_contains "$target" "[main]"
+  assert_contains "$target" "include=$tracked"
+  awk -v include_line="include=$tracked" '
+    $0 == "[main]" { previous = $0; next }
+    $0 == include_line {
+      if (previous != "[main]") {
+        exit 1
+      }
+      found = 1
+    }
+    { previous = $0 }
+    END { exit found ? 0 : 1 }
+  ' "$target"
+  foot -C -c "$target"
+}
+
+test_rejects_retired_and_unregistered_adapters() {
+  local rel
+
+  for rel in \
+    hypr/hyprsunset.conf \
+    hypr/xdph.conf \
+    uwsm/env \
+    hooks/custom.sh \
+    waybar/config.jsonc; do
+    mkdir -p "$HOME/.config/$(dirname -- "$rel")"
+    printf 'value\n' >"$HOME/.config/$rel"
+    assert_status 1 run_stomarchy add "$HOME/.config/$rel" >out.log 2>err.log
+    assert_contains err.log "Unsupported config adapter"
+  done
+}
+
+test_inputrc_full_file_lifecycle() {
+  local target="$HOME/.inputrc"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.inputrc"
+  local expected="$TEST_ROOT/expected"
+
+  printf 'set editing-mode vi\nset completion-ignore-case on\n' >"$target"
+  cp "$target" "$expected"
+  run_stomarchy add "$target"
+
+  assert_same "$expected" "$target"
+  assert_same "$expected" "$tracked"
+  assert_not_contains "$target" "\$include"
+
+  printf 'set editing-mode emacs\n' >"$tracked"
+  run_stomarchy link "$target"
+  assert_same "$tracked" "$target"
+  run_stomarchy status --check --porcelain >status.log
+  assert_contains status.log $'~/.inputrc\tlinked'
+
+  cp "$target" "$expected"
+  run_stomarchy remove "$target"
+  assert_not_exists "$tracked"
+  assert_same "$expected" "$target"
+}
+
+test_uwsm_default_is_full_file() {
+  local target="$HOME/.config/uwsm/default"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/uwsm/default"
+
+  mkdir -p "$(dirname -- "$target")"
+  printf 'export TERMINAL=xdg-terminal-exec\n' >"$target"
+  run_stomarchy add "$target"
+  assert_same "$target" "$tracked"
+
+  printf 'export TERMINAL=foot\n' >"$tracked"
+  run_stomarchy link
+  assert_same "$target" "$tracked"
+
+  run_stomarchy wipe
+  assert_same "$target" "$tracked"
+}
+
+test_baselines_distinguish_upstream_change_and_drift() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 9\nwindow-padding-x = 8\n' >"$target"
+  run_stomarchy add "$target"
+
+  printf 'font-size = 10\n' >"$original"
+  assert_status 1 run_stomarchy status --check --porcelain >status.log
+  assert_contains status.log "upstream-changed"
+
+  cp "$original" "$target"
+  assert_status 1 run_stomarchy status --check --porcelain >reset-status.log
+  assert_contains reset-status.log "upstream-changed"
+  run_stomarchy add "$target" >reset-add.log
+  assert_contains reset-add.log "run 'stomarchy sync'"
+  assert_not_contains "$target" "BEGIN Stomarchy tweaks"
+
+  run_stomarchy sync
+  assert_contains "$target" "font-size = 10"
+  assert_contains "$target" "BEGIN Stomarchy tweaks"
+
+  printf '# direct edit\n' >>"$target"
+  cp "$target" drifted
+  assert_status 1 run_stomarchy sync >out.log 2>err.log
+  assert_same drifted "$target"
+  assert_contains err.log "Target drift detected"
+}
+
+test_tracked_only_sync_and_wipe_leave_mirror_alone() {
+  local lua_original="$STOMARCHY_OMARCHY_ROOT/config/hypr/input.lua"
+  local lua_target="$HOME/.config/hypr/input.lua"
+  local waybar_original="$STOMARCHY_OMARCHY_ROOT/config/waybar/config.jsonc"
+  local waybar_target="$HOME/.config/waybar/config.jsonc"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/hypr/input.lua"
+
+  mkdir -p "$(dirname -- "$lua_original")" "$(dirname -- "$lua_target")"
+  mkdir -p "$(dirname -- "$waybar_original")" "$(dirname -- "$waybar_target")"
+  printf 'o.input.sensitivity = 0\n' >"$lua_original"
+  printf 'o.input.sensitivity = 0\no.input.sensitivity = -0.5\n' >"$lua_target"
+  printf '{"position":"top"}\n' >"$waybar_original"
+  printf '{"user":"keep"}\n' >"$waybar_target"
+  cp "$waybar_target" waybar.expected
+
+  run_stomarchy add "$lua_target"
+  printf 'o.input.sensitivity = 1\n' >"$lua_original"
+  run_stomarchy sync
+  assert_same waybar.expected "$waybar_target"
+
+  run_stomarchy wipe
+  assert_same "$lua_original" "$lua_target"
+  assert_file_exists "$tracked"
+  assert_same waybar.expected "$waybar_target"
+}
+
+test_all_requires_force_and_snapshots() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/waybar/config.jsonc"
+  local target="$HOME/.config/waybar/config.jsonc"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf '{"position":"top"}\n' >"$original"
+  printf '{"position":"bottom"}\n' >"$target"
+
+  assert_status 2 run_stomarchy sync --all >out.log 2>err.log
+  assert_contains err.log "requires --force"
+  assert_contains "$target" "bottom"
+
+  run_stomarchy sync --all --force >out.log 2>err.log
+  assert_same "$original" "$target"
+  assert_contains err.log "Recovery snapshot"
+  find "$XDG_STATE_HOME/stomarchy/recovery" -path '*/targets/config/waybar/config.jsonc' -type f -print -quit |
+    grep -q . || fail "Expected recovery copy of Waybar target"
+}
+
+test_all_refuses_retired_tracked_files() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/waybar/config.jsonc"
+  local target="$HOME/.config/waybar/config.jsonc"
+  local retired="$XDG_CONFIG_HOME/stomarchy/.config/hypr/old.conf"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")" "$(dirname -- "$retired")"
+  printf '{"position":"top"}\n' >"$original"
+  printf '{"position":"bottom"}\n' >"$target"
+  printf 'legacy tracked content\n' >"$retired"
+
+  assert_status 1 run_stomarchy sync --all --force >out.log 2>err.log
+  assert_contains err.log "Unsupported tracked file blocks --all"
+  assert_contains "$target" "bottom"
+  assert_not_exists "$XDG_STATE_HOME/stomarchy/recovery"
+}
+
+test_dry_runs_create_no_persistent_files() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/kitty/kitty.conf"
+  local target="$HOME/.config/kitty/kitty.conf"
+
+  rm -rf -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font_size 9\n' >"$original"
+  printf 'font_size 9\nfont_size 11\n' >"$target"
+
+  run_stomarchy add "$target" --dry-run >out.log
+  assert_not_exists "$XDG_CONFIG_HOME"
+  assert_not_exists "$XDG_STATE_HOME"
+  assert_contains "$target" "font_size 11"
+}
+
+test_malformed_markers_are_rejected() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+  local before
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")" "$(dirname -- "$tracked")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 11\n' >"$tracked"
+  {
+    cat "$original"
+    printf '\n# BEGIN Stomarchy tweaks\n'
+    printf '# BEGIN Stomarchy tweaks\n'
+    printf 'config-file = "%s"\n' "$tracked"
+    printf '# END Stomarchy tweaks\n'
+  } >"$target"
+  before=$(sha256sum "$target")
+
+  assert_status 1 run_stomarchy link >out.log 2>err.log
+  assert_eq "$before" "$(sha256sum "$target")" "malformed target changed"
+  assert_contains err.log "Malformed"
+}
+
+test_orphaned_valid_marker_is_not_recaptured() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+  local before
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font-size = 9\n' >"$original"
+  {
+    cat "$original"
+    printf '\n# BEGIN Stomarchy tweaks\n'
+    printf 'config-file = "%s"\n' "$tracked"
+    printf '# END Stomarchy tweaks\n'
+  } >"$target"
+  before=$(sha256sum "$target")
+
+  assert_status 1 run_stomarchy add "$target" >out.log 2>err.log
+  assert_eq "$before" "$(sha256sum "$target")" "orphaned managed target changed"
+  assert_not_exists "$tracked"
+  assert_contains err.log "tracked tweak is missing"
+}
+
+test_symlink_destination_is_rejected_without_touching_referent() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/kitty/kitty.conf"
+  local target="$HOME/.config/kitty/kitty.conf"
+  local referent="$TEST_ROOT/referent"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font_size 9\n' >"$original"
+  printf 'do not touch\n' >"$referent"
+  ln -s "$referent" "$target"
+
+  assert_status 1 run_stomarchy add "$target" >out.log 2>err.log
+  assert_contains err.log "symlink"
+  assert_contains "$referent" "do not touch"
+}
+
+test_symlink_lock_is_rejected_without_truncating_referent() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local referent="$TEST_ROOT/lock-referent"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")" "$XDG_STATE_HOME/stomarchy"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 9\nfont-size = 11\n' >"$target"
+  printf 'keep this lock data\n' >"$referent"
+  ln -s "$referent" "$XDG_STATE_HOME/stomarchy/lock"
+
+  assert_status 1 run_stomarchy add "$target" >out.log 2>err.log
+  assert_contains err.log "Mutation lock is a symlink"
+  assert_contains "$referent" "keep this lock data"
+  assert_contains "$target" "font-size = 11"
+}
+
+test_bulk_preflight_failure_changes_nothing() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+  local unsupported="$XDG_CONFIG_HOME/stomarchy/.config/hypr/old.conf"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$tracked")" "$(dirname -- "$unsupported")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 11\n' >"$tracked"
+  printf 'legacy\n' >"$unsupported"
+
+  assert_status 1 run_stomarchy link >out.log 2>err.log
+  assert_not_exists "$target"
+  assert_contains err.log "Unsupported tracked adapter"
+  assert_contains err.log "no tracked targets were changed"
+}
+
+test_read_only_original_and_failed_remove_restore() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/kitty/kitty.conf"
+  local target="$HOME/.config/kitty/kitty.conf"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/kitty/kitty.conf"
+  local target_dir
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font_size 9\n' >"$original"
+  chmod 444 "$original"
+  printf 'font_size 9\nfont_size 11\n' >"$target"
+  run_stomarchy add "$target"
+  assert_file_exists "$tracked"
+
+  target_dir=$(dirname -- "$target")
+  chmod 500 "$target_dir"
+  set +e
+  run_stomarchy remove "$target" >out.log 2>err.log
+  remove_status=$?
+  set -e
+  chmod 700 "$target_dir"
+  assert_eq 1 "$remove_status" "remove unexpectedly succeeded with unwritable target directory"
+  assert_file_exists "$tracked"
+}
+
+test_force_link_snapshots_conflict() {
+  local original="$STOMARCHY_OMARCHY_ROOT/config/ghostty/config"
+  local target="$HOME/.config/ghostty/config"
+  local tracked="$XDG_CONFIG_HOME/stomarchy/.config/ghostty/config"
+
+  mkdir -p "$(dirname -- "$original")" "$(dirname -- "$target")"
+  printf 'font-size = 9\n' >"$original"
+  printf 'font-size = 9\nfont-size = 11\n' >"$target"
+  run_stomarchy add "$target"
+  printf '# drift\n' >>"$target"
+
+  run_stomarchy link "$target" --force >out.log 2>err.log
+  assert_not_contains "$target" "# drift"
+  assert_contains "$target" "config-file"
+  find "$XDG_STATE_HOME/stomarchy/recovery" -path '*/targets/config/ghostty/config' -type f -print -quit |
+    grep -q . || fail "Expected forced-link target snapshot"
+  assert_file_exists "$tracked"
+}
+
+test_cli_contract_and_deprecated_preview() {
+  local command
+
+  assert_eq "stomarchy 0.2.0" "$(run_stomarchy --version)"
+  run_stomarchy --help >main.help
+  assert_contains main.help "hypr/*.lua"
+  assert_contains main.help "sync and wipe are tracked-only"
+  assert_contains main.help "STOMARCHY_OMARCHY_ROOT"
+  for command in add link remove sync wipe status; do
+    run_stomarchy "$command" --help >"$command.help"
+    assert_contains "$command.help" "Usage: stomarchy $command"
+  done
+
+  assert_status 2 run_stomarchy status extra >out.log 2>err.log
+  assert_status 2 run_stomarchy sync operand >out.log 2>err.log
+  run_stomarchy sync --preview >out.log 2>err.log
+  assert_contains err.log "deprecated"
+  assert_not_contains err.log $'\033'
+}
+
+test_install_is_relative_staged_and_versioned() {
+  local stage="$TEST_ROOT/stage"
+
+  (
+    cd /
+    DESTDIR="$stage" PREFIX=/usr "$ROOT_DIR/install.sh" >"$TEST_ROOT/install.log"
+  )
+
+  assert_file_exists "$stage/usr/bin/stomarchy"
+  assert_file_exists "$stage/usr/share/bash-completion/completions/stomarchy"
+  assert_file_exists "$stage/usr/share/man/man1/stomarchy.1"
+  assert_file_exists "$stage/usr/share/licenses/stomarchy/LICENSE"
+  assert_eq "stomarchy 0.2.0" "$("$stage/usr/bin/stomarchy" --version)"
+}
+
+test_distribution_version_and_checksum_contract() {
+  local expected
+  local actual
+  local -a source_files=(
+    "$ROOT_DIR/stomarchy"
+    "$ROOT_DIR/completions/stomarchy.bash"
+    "$ROOT_DIR/man/stomarchy.1"
+    "$ROOT_DIR/LICENSE"
+  )
+  local -a package_hashes=()
+  local file
+
+  assert_contains "$ROOT_DIR/stomarchy" 'VERSION="0.2.0"'
+  assert_contains "$ROOT_DIR/PKGBUILD" 'pkgver=0.2.0'
+  assert_contains "$ROOT_DIR/man/stomarchy.1" '"stomarchy 0.2.0"'
+
+  while IFS= read -r expected; do
+    package_hashes+=("$expected")
+  done < <(sed -n "/^sha256sums=(/,/^)/s/.*'\\([[:xdigit:]]\\{64\\}\\)'.*/\\1/p" "$ROOT_DIR/PKGBUILD")
+
+  assert_eq 4 "${#package_hashes[@]}" "PKGBUILD checksum count"
+  for file in "${!source_files[@]}"; do
+    actual=$(sha256sum "${source_files[$file]}")
+    actual=${actual%% *}
+    assert_eq "${package_hashes[$file]}" "$actual" "PKGBUILD checksum mismatch"
+  done
+}
+
+test_completion_preserves_spaces() {
+  local found=false
+  local completion
+
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/completions/stomarchy.bash"
+  touch "file with spaces.lua"
+  COMP_WORDS=(stomarchy add file)
+  COMP_CWORD=2
+  _stomarchy
+
+  for completion in "${COMPREPLY[@]}"; do
+    if [[ $completion == "file with spaces.lua" ]]; then
+      found=true
     fi
-
-    rm -rf "$tmp_dir"
+  done
+  [[ $found == true ]] || fail "Completion split a filename containing spaces"
 }
 
-test_rejects_unsupported_outside_paths() {
-    mkdir -p "${HOME}/Documents"
-    printf 'x\n' > "${HOME}/Documents/file.conf"
+test_compat_config_override_and_bash_root() {
+  local override="$TEST_ROOT/compat/config"
+  local target="$HOME/.config/ghostty/config"
 
-    if "$SCRIPT" add "${HOME}/Documents/file.conf" > out.log 2> err.log; then
-        fail "add succeeded for an unsupported file outside ~/.config"
-    fi
+  mkdir -p "$override/ghostty" "$(dirname -- "$target")"
+  printf 'font-size = 7\n' >"$override/ghostty/config"
+  printf 'font-size = 7\nfont-size = 12\n' >"$target"
 
-    assert_file_contains err.log "File must be under config directory"
+  STOMARCHY_OMARCHY_CONFIG_DIR="$override/" \
+    STOMARCHY_OMARCHY_ROOT="$STOMARCHY_OMARCHY_ROOT/" \
+    run_stomarchy add "$target"
+  assert_contains "$target" "BEGIN Stomarchy tweaks"
+
+  printf 'BASE=from-default\n' >"$STOMARCHY_OMARCHY_ROOT/default/bashrc"
+  printf 'BASE=from-default\nEXTRA=yes\n' >"$HOME/.bashrc"
+  STOMARCHY_OMARCHY_CONFIG_DIR="$override/" \
+    STOMARCHY_OMARCHY_ROOT="$STOMARCHY_OMARCHY_ROOT/" \
+    run_stomarchy add "$HOME/.bashrc"
+  assert_contains "$HOME/.bashrc" "BASE=from-default"
 }
 
-test_rejects_missing_original() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr"
-    printf 'workspace = 1\n' > "${XDG_CONFIG_HOME}/hypr/missing.conf"
+test_sibling_quattro_contract() {
+  local quattro=${STOMARCHY_QUATTRO_CHECKOUT:-/home/alex/Projects/omarchy}
+  local target
+  local tracked
 
-    if "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/missing.conf" > out.log 2> err.log; then
-        fail "add succeeded without an Omarchy original"
-    fi
+  if [[ ! -f $quattro/version ]]; then
+    printf 'skip: sibling Quattro checkout not present at %s\n' "$quattro"
+    return 0
+  fi
+  assert_eq "4.0.0.alpha" "$(<"$quattro/version")"
+  assert_file_exists "$quattro/default/bashrc"
+  assert_file_exists "$quattro/config/hypr/hyprland.lua"
+  assert_file_exists "$quattro/config/hypr/hyprsunset.conf"
+  assert_file_exists "$quattro/config/hypr/xdph.conf"
+  assert_file_exists "$quattro/default/uwsm/default"
 
-    assert_file_contains err.log "Omarchy original not found"
+  export STOMARCHY_OMARCHY_ROOT="$quattro///"
+  target="$HOME/.config/hypr/hyprland.lua"
+  tracked="$XDG_CONFIG_HOME/stomarchy/.config/hypr/hyprland.lua"
+  mkdir -p "$(dirname -- "$target")"
+  cp "$quattro/config/hypr/hyprland.lua" "$target"
+  printf '\no.general.gaps_in = 4\n' >>"$target"
+  run_stomarchy add "$target"
+  assert_contains "$tracked" "o.general.gaps_in = 4"
+  luac -p "$target"
 }
 
-test_hypr_conf_tweak() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, firefox"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/bindings.conf" > out.log
-
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    assert_file_contains "$tweak" "unbind = SUPER, B"
-    assert_file_contains "$tweak" "bind = SUPER, B, exec, firefox"
-    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
-}
-
-test_hypr_lua_top_level_tweak() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo 'local hl = require("hyprland")'
-        echo 'hl.set("general:gaps_in", 5)'
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/hyprland.lua"
-
-    {
-        echo 'local hl = require("hyprland")'
-        echo 'hl.set("general:gaps_in", 5)'
-        echo 'hl.set("general:gaps_out", 12)'
-    } > "${XDG_CONFIG_HOME}/hypr/hyprland.lua"
-
-    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/hyprland.lua" > out.log
-
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/hyprland.lua"
-    assert_file_contains "$tweak" 'hl.set("general:gaps_out", 12)'
-}
-
-test_hypr_lua_bind_replacement() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    echo 'hl.bind("SUPER, B", function() hl.spawn("brave") end)' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/hyprland.lua"
-    echo 'hl.bind("SUPER, B", function() hl.spawn("firefox") end)' > "${XDG_CONFIG_HOME}/hypr/hyprland.lua"
-
-    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/hyprland.lua" > out.log
-
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/hyprland.lua"
-    assert_file_contains "$tweak" 'hl.unbind("SUPER, B")'
-    assert_file_contains "$tweak" 'hl.bind("SUPER, B", function() hl.spawn("firefox") end)'
-}
-
-test_hypr_lua_partial_table_skip() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo "hl.config({"
-        echo "  general = {"
-        echo "    gaps_in = 5,"
-        echo "  },"
-        echo "})"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/hyprland.lua"
-
-    {
-        echo "hl.config({"
-        echo "  general = {"
-        echo "    gaps_in = 4,"
-        echo "  },"
-        echo "})"
-    } > "${XDG_CONFIG_HOME}/hypr/hyprland.lua"
-
-    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/hyprland.lua" > out.log
-
-    assert_empty_file "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/hyprland.lua"
-    assert_file_contains out.log "Skipped Lua edits"
-}
-
-test_unsupported_waybar_fails() {
-    mkdir -p "${XDG_CONFIG_HOME}/waybar" "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar"
-
-    echo '{"position": "top"}' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar/config.jsonc"
-    echo '{"position": "bottom"}' > "${XDG_CONFIG_HOME}/waybar/config.jsonc"
-
-    if "$SCRIPT" add "${XDG_CONFIG_HOME}/waybar/config.jsonc" > out.log 2> err.log; then
-        fail "add succeeded for unsupported Waybar JSONC"
-    fi
-
-    assert_file_contains err.log "Unsupported config format"
-    assert_file_not_exists "${XDG_CONFIG_HOME}/stomarchy/.config/waybar/config.jsonc"
-}
-
-test_add_restores_original_and_is_idempotent() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, firefox"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    "$SCRIPT" add "$target" > add-one.log
-
-    assert_file_contains "$target" "bind = SUPER, B, exec, brave"
-    assert_file_contains "$target" "source = ${tweak}"
-    assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
-    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
-
-    assert_no_backup_files
-
-    "$SCRIPT" add "$target" > add-two.log
-    [ "$(grep -c "BEGIN Stomarchy tweaks" "$target")" -eq 1 ] || fail "Expected one Stomarchy block after repeated add"
-    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, zen-browser"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    "$SCRIPT" add "$target" > add-after-original-change.log
-    assert_file_contains "$target" "bind = SUPER, B, exec, zen-browser"
-    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
-    assert_file_not_contains "$tweak" "zen-browser"
-}
-
-test_add_dry_run_previews_tweak_without_writing() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    "$SCRIPT" add --dry-run "$target" > add.log
-
-    assert_file_not_exists "$tweak"
-    assert_file_contains "$target" "workspace = 1, monitor:DP-3"
-    assert_file_not_contains "$target" "BEGIN Stomarchy tweaks"
-    assert_file_contains add.log "Dry run: no files changed"
-    assert_file_contains add.log "workspace = 1, monitor:DP-3"
-}
-
-test_legacy_customization_blocks_become_tweak_blocks() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo ""
-        echo "# BEGIN Stomarchy customizations"
-        echo "source = ${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-        echo "# END Stomarchy customizations"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    "$SCRIPT" add "${XDG_CONFIG_HOME}/hypr/bindings.conf" > add.log
-
-    assert_file_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "BEGIN Stomarchy tweaks"
-    assert_file_not_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "BEGIN Stomarchy customizations"
-}
-
-test_lua_add_uses_tracked_tweak_path() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    echo 'hl.set("general:gaps_in", 5)' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/hyprland.lua"
-    {
-        echo 'hl.set("general:gaps_in", 5)'
-        echo 'hl.set("general:gaps_out", 12)'
-    } > "${XDG_CONFIG_HOME}/hypr/hyprland.lua"
-
-    local target="${XDG_CONFIG_HOME}/hypr/hyprland.lua"
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/hyprland.lua"
-
-    "$SCRIPT" add "$target" > add.log
-
-    assert_file_contains "$target" "dofile(\"${tweak}\")"
-    assert_file_contains "$target" "BEGIN Stomarchy tweaks"
-    assert_file_not_contains "$target" "BEGIN Stomarchy customizations"
-    assert_file_not_contains "$target" "_stomarchy"
-}
-
-test_bashrc_add_tracks_home_dotfile() {
-    {
-        echo "alias ll='ls -la'"
-        echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.bashrc"
-
-    {
-        echo "alias ll='ls -la'"
-        echo "export PATH=\"\$HOME/.local/bin:\$PATH\""
-        echo "export EDITOR=vim"
-    } > "${HOME}/.bashrc"
-
-    "$SCRIPT" add "${HOME}/.bashrc" > add.log
-
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.bashrc"
-
-    assert_file_contains "$tweak" "export EDITOR=vim"
-    assert_file_contains "${HOME}/.bashrc" "alias ll='ls -la'"
-    assert_file_contains "${HOME}/.bashrc" "source \"${tweak}\""
-    assert_file_not_contains "${HOME}/.bashrc" "export EDITOR=vim"
-}
-
-test_inputrc_add_tracks_home_dotfile() {
-    echo "set editing-mode vi" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.inputrc"
-
-    {
-        echo "set editing-mode vi"
-        echo "set completion-ignore-case on"
-    } > "${HOME}/.inputrc"
-
-    "$SCRIPT" add "${HOME}/.inputrc" > add.log
-
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.inputrc"
-
-    assert_file_contains "$tweak" "set completion-ignore-case on"
-    assert_file_contains "${HOME}/.inputrc" "set editing-mode vi"
-    assert_file_contains "${HOME}/.inputrc" "\$include ${tweak}"
-    assert_file_not_contains "${HOME}/.inputrc" "set completion-ignore-case on"
-}
-
-test_link_checked_out_tweaks() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/ghostty" "${XDG_CONFIG_HOME}/ghostty"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    echo "workspace = 1, monitor:DP-3" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    echo "font-size = 9" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty/config"
-    echo "font-size = 11" > "${XDG_CONFIG_HOME}/stomarchy/.config/ghostty/config"
-    echo "user-edited stale target" > "${XDG_CONFIG_HOME}/ghostty/config"
-
-    "$SCRIPT" link > link.log
-
-    local hypr_target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local hypr_tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    local ghostty_target="${XDG_CONFIG_HOME}/ghostty/config"
-    local ghostty_tweak="${XDG_CONFIG_HOME}/stomarchy/.config/ghostty/config"
-
-    assert_file_contains "$hypr_target" "bind = SUPER, B, exec, brave"
-    assert_file_contains "$hypr_target" "source = ${hypr_tweak}"
-    assert_file_contains "$hypr_tweak" "workspace = 1, monitor:DP-3"
-    assert_file_contains "$ghostty_target" "font-size = 9"
-    assert_file_contains "$ghostty_target" "config-file = \"${ghostty_tweak}\""
-    assert_file_contains "$ghostty_tweak" "font-size = 11"
-    assert_no_backup_files
-    assert_file_contains link.log "Linked 2 tweak"
-}
-
-test_link_single_file() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/ghostty"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    echo "font-size = 9" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty/config"
-    echo "font-size = 11" > "${XDG_CONFIG_HOME}/stomarchy/.config/ghostty/config"
-
-    "$SCRIPT" link "${XDG_CONFIG_HOME}/hypr/bindings.conf" > link.log
-
-    assert_file_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "source = ${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    assert_file_not_exists "${XDG_CONFIG_HOME}/ghostty/config"
-}
-
-test_link_single_tracked_file() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    "$SCRIPT" link "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf" > link.log
-
-    assert_file_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "source = ${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-}
-
-test_link_home_dotfiles() {
-    mkdir -p "${XDG_CONFIG_HOME}/stomarchy"
-
-    echo "alias ll='ls -la'" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.bashrc"
-    echo "set editing-mode vi" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.inputrc"
-    echo "export EDITOR=vim" > "${XDG_CONFIG_HOME}/stomarchy/.bashrc"
-    echo "set completion-ignore-case on" > "${XDG_CONFIG_HOME}/stomarchy/.inputrc"
-
-    "$SCRIPT" link > link.log
-
-    assert_file_contains "${HOME}/.bashrc" "source \"${XDG_CONFIG_HOME}/stomarchy/.bashrc\""
-    assert_file_contains "${HOME}/.inputrc" "\$include ${XDG_CONFIG_HOME}/stomarchy/.inputrc"
-    assert_file_contains link.log "Linked 2 tweak"
-}
-
-test_link_ignores_git_checkout_files() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr" "${XDG_CONFIG_HOME}/stomarchy/.git/objects"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    echo "ref: refs/heads/main" > "${XDG_CONFIG_HOME}/stomarchy/.git/HEAD"
-    echo "[core]" > "${XDG_CONFIG_HOME}/stomarchy/.git/config"
-
-    "$SCRIPT" link > link.log 2> err.log
-
-    assert_file_contains "${XDG_CONFIG_HOME}/hypr/bindings.conf" "source = ${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    assert_file_contains link.log "Linked 1 tweak"
-    assert_file_not_contains err.log ".git"
-}
-
-test_link_missing_tweak_fails() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    if "$SCRIPT" link "${XDG_CONFIG_HOME}/hypr/bindings.conf" > out.log 2> err.log; then
-        fail "link succeeded without a tweak"
-    fi
-
-    assert_file_contains err.log "Tweak not found"
-}
-
-test_status_reports_tweak_health() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/waybar"
-
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    echo "bind = SUPER, Return, exec, kitty" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/empty.conf"
-    : > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/empty.conf"
-    echo "workspace = 9" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/old.conf"
-    echo '{"position": "top"}' > "${XDG_CONFIG_HOME}/stomarchy/.config/waybar/config.jsonc"
-
-    "$SCRIPT" link "${XDG_CONFIG_HOME}/hypr/bindings.conf" > link.log
-    "$SCRIPT" status > status.log
-
-    assert_file_contains status.log "~/.config/hypr/bindings.conf [linked]"
-    assert_file_contains status.log "~/.config/hypr/empty.conf [no-op, unlinked, stale]"
-    assert_file_contains status.log "~/.config/hypr/old.conf [missing-original, unlinked]"
-    assert_file_contains status.log "~/.config/waybar/config.jsonc [unsupported, missing-original, unlinked]"
-}
-
-test_apply_command_removed() {
-    if "$SCRIPT" apply > out.log 2> err.log; then
-        fail "apply command unexpectedly succeeded"
-    fi
-
-    assert_file_contains err.log "Unknown command: apply"
-}
-
-test_removed_commands_are_unknown() {
-    if "$SCRIPT" bootstrap > out.log 2> err.log; then
-        fail "bootstrap command unexpectedly succeeded"
-    fi
-
-    assert_file_contains err.log "Unknown command: bootstrap"
-
-    if "$SCRIPT" completion bash > out.log 2> err.log; then
-        fail "completion command unexpectedly succeeded"
-    fi
-
-    assert_file_contains err.log "Unknown command: completion"
-}
-
-test_remove_restores_default_and_deletes_tweak() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, firefox"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    "$SCRIPT" add "$target" > add.log
-    assert_file_exists "$tweak"
-    assert_file_contains "$target" "source = ${tweak}"
-
-    "$SCRIPT" remove "$target" > remove.log
-
-    assert_file_not_exists "$tweak"
-    assert_file_contains "$target" "bind = SUPER, B, exec, brave"
-    assert_file_not_contains "$target" "source = ${tweak}"
-    assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
-    assert_no_backup_files
-}
-
-test_remove_untracked_missing_target_restores_default() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty"
-    echo 'font-size = 9' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty/config"
-
-    local target="${XDG_CONFIG_HOME}/ghostty/config"
-
-    "$SCRIPT" remove "$target" > remove.log
-
-    assert_file_contains "$target" "font-size = 9"
-    assert_file_contains remove.log "No tweak found"
-}
-
-test_remove_missing_original_fails() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/hypr/missing.conf"
-
-    if "$SCRIPT" remove "${XDG_CONFIG_HOME}/hypr/missing.conf" > out.log 2> err.log; then
-        fail "remove succeeded without an Omarchy original"
-    fi
-
-    assert_file_contains err.log "Omarchy original not found"
-}
-
-test_sync_copies_local_defaults_and_reapplies_imports() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${XDG_CONFIG_HOME}/waybar" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar" "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, firefox"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    echo '{"position": "bottom"}' > "${XDG_CONFIG_HOME}/waybar/config.jsonc"
-    echo '{"position": "top"}' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar/config.jsonc"
-    echo 'font-size = 9' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/ghostty/config"
-
-    local hypr_target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local hypr_tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-    local waybar_target="${XDG_CONFIG_HOME}/waybar/config.jsonc"
-    local ghostty_target="${XDG_CONFIG_HOME}/ghostty/config"
-
-    "$SCRIPT" add "$hypr_target" > add.log
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, zen-browser"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    "$SCRIPT" sync > sync.log
-
-    assert_file_contains "$hypr_target" "bind = SUPER, B, exec, zen-browser"
-    assert_file_contains "$hypr_target" "source = ${hypr_tweak}"
-    assert_file_not_contains "$hypr_target" "workspace = 1, monitor:DP-3"
-    assert_file_contains "$hypr_tweak" "workspace = 1, monitor:DP-3"
-    assert_file_contains "$waybar_target" '{"position": "top"}'
-    assert_file_not_contains "$waybar_target" '{"position": "bottom"}'
-    assert_file_contains "$ghostty_target" "font-size = 9"
-    assert_no_backup_files
-    assert_file_contains sync.log "applied 1 import block"
-}
-
-test_sync_dry_run_shows_diff_without_writing() {
-    mkdir -p "${XDG_CONFIG_HOME}/waybar" "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar"
-
-    echo '{"position": "bottom"}' > "${XDG_CONFIG_HOME}/waybar/config.jsonc"
-    echo '{"position": "top"}' > "${STOMARCHY_OMARCHY_CONFIG_DIR}/waybar/config.jsonc"
-
-    local target="${XDG_CONFIG_HOME}/waybar/config.jsonc"
-
-    "$SCRIPT" sync --dry-run > sync.log
-
-    assert_file_contains "$target" '{"position": "bottom"}'
-    assert_file_contains sync.log "Would update: ~/.config/waybar/config.jsonc"
-    assert_file_contains sync.log '-{"position": "bottom"}'
-    assert_file_contains sync.log '+{"position": "top"}'
-    assert_file_contains sync.log "Would sync 1 file"
-    assert_no_backup_files
-}
-
-test_sync_missing_omarchy_config_dir_fails() {
-    rm -rf "$STOMARCHY_OMARCHY_CONFIG_DIR"
-
-    if "$SCRIPT" sync > out.log 2> err.log; then
-        fail "sync succeeded without Omarchy config directory"
-    fi
-
-    assert_file_contains err.log "Omarchy config directory not found"
-}
-
-test_sync_warns_for_tracked_file_without_original() {
-    mkdir -p "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr" "${XDG_CONFIG_HOME}/stomarchy/.config/hypr"
-    echo "bind = SUPER, Q, killactive" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-    echo "workspace = 1" > "${XDG_CONFIG_HOME}/stomarchy/.config/hypr/old.conf"
-
-    "$SCRIPT" sync > out.log
-
-    assert_file_contains out.log "Tweak has no current Omarchy original"
-}
-
-test_wipe_restores_baselines_without_deleting_tweaks() {
-    mkdir -p "${XDG_CONFIG_HOME}/hypr" "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, brave"
-    } > "${STOMARCHY_OMARCHY_CONFIG_DIR}/hypr/bindings.conf"
-
-    {
-        echo "bind = SUPER, Q, killactive"
-        echo "bind = SUPER, B, exec, firefox"
-        echo "workspace = 1, monitor:DP-3"
-    } > "${XDG_CONFIG_HOME}/hypr/bindings.conf"
-
-    local target="${XDG_CONFIG_HOME}/hypr/bindings.conf"
-    local tweak="${XDG_CONFIG_HOME}/stomarchy/.config/hypr/bindings.conf"
-
-    "$SCRIPT" add "$target" > add.log
-    "$SCRIPT" wipe > wipe.log
-
-    assert_file_contains "$target" "bind = SUPER, B, exec, brave"
-    assert_file_not_contains "$target" "BEGIN Stomarchy tweaks"
-    assert_file_not_contains "$target" "source = ${tweak}"
-    assert_file_not_contains "$target" "workspace = 1, monitor:DP-3"
-    assert_file_contains "$tweak" "workspace = 1, monitor:DP-3"
-    assert_no_backup_files
-    assert_file_contains wipe.log "Wiped"
-}
-
-test_wipe_restores_home_dotfiles() {
-    echo "alias ll='ls -la'" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.bashrc"
-    echo "set editing-mode vi" > "${STOMARCHY_OMARCHY_CONFIG_DIR}/.inputrc"
-
-    {
-        echo "alias ll='ls -la'"
-        echo "export EDITOR=vim"
-    } > "${HOME}/.bashrc"
-
-    {
-        echo "set editing-mode vi"
-        echo "set completion-ignore-case on"
-    } > "${HOME}/.inputrc"
-
-    "$SCRIPT" add "${HOME}/.bashrc" > bashrc-add.log
-    "$SCRIPT" add "${HOME}/.inputrc" > inputrc-add.log
-    "$SCRIPT" wipe > wipe.log
-
-    assert_file_contains "${HOME}/.bashrc" "alias ll='ls -la'"
-    assert_file_not_contains "${HOME}/.bashrc" "source \"${XDG_CONFIG_HOME}/stomarchy/.bashrc\""
-    assert_file_not_contains "${HOME}/.bashrc" "export EDITOR=vim"
-    assert_file_contains "${HOME}/.inputrc" "set editing-mode vi"
-    assert_file_not_contains "${HOME}/.inputrc" "\$include ${XDG_CONFIG_HOME}/stomarchy/.inputrc"
-    assert_file_not_contains "${HOME}/.inputrc" "set completion-ignore-case on"
-    assert_file_exists "${XDG_CONFIG_HOME}/stomarchy/.bashrc"
-    assert_file_exists "${XDG_CONFIG_HOME}/stomarchy/.inputrc"
-}
-
-test_wipe_missing_omarchy_config_dir_fails() {
-    rm -rf "$STOMARCHY_OMARCHY_CONFIG_DIR"
-
-    if "$SCRIPT" wipe > out.log 2> err.log; then
-        fail "wipe succeeded without Omarchy config directory"
-    fi
-
-    assert_file_contains err.log "Omarchy config directory not found"
-}
-
-test_completion_and_man_assets() {
-    assert_file_contains "${ROOT_DIR}/completions/stomarchy.bash" "complete -F _stomarchy stomarchy"
-    assert_file_contains "${ROOT_DIR}/completions/stomarchy.bash" "wipe"
-    assert_file_not_contains "${ROOT_DIR}/completions/stomarchy.bash" "bootstrap"
-    assert_file_not_contains "${ROOT_DIR}/completions/stomarchy.bash" "completion"
-    assert_file_contains "${ROOT_DIR}/man/stomarchy.1" "wipe"
-    assert_file_not_contains "${ROOT_DIR}/man/stomarchy.1" "bootstrap"
-    assert_file_not_contains "${ROOT_DIR}/man/stomarchy.1" "completion"
-}
-
-
-with_temp_home "rejects unsupported outside paths" test_rejects_unsupported_outside_paths
-with_temp_home "rejects missing Omarchy original" test_rejects_missing_original
-with_temp_home "Hyprland conf tweaks include unbinds" test_hypr_conf_tweak
-with_temp_home "Hyprland Lua top-level tweaks" test_hypr_lua_top_level_tweak
-with_temp_home "Hyprland Lua bind replacements" test_hypr_lua_bind_replacement
-with_temp_home "Hyprland Lua partial table edits are skipped" test_hypr_lua_partial_table_skip
-with_temp_home "unsupported Waybar JSONC fails" test_unsupported_waybar_fails
-with_temp_home "add restores originals and is idempotent" test_add_restores_original_and_is_idempotent
-with_temp_home "add dry-run previews tweak without writing" test_add_dry_run_previews_tweak_without_writing
-with_temp_home "legacy customization blocks become tweak blocks" test_legacy_customization_blocks_become_tweak_blocks
-with_temp_home "Lua add uses tweak path" test_lua_add_uses_tracked_tweak_path
-with_temp_home "bashrc add tracks home dotfile" test_bashrc_add_tracks_home_dotfile
-with_temp_home "inputrc add tracks home dotfile" test_inputrc_add_tracks_home_dotfile
-with_temp_home "link checked-out tweaks" test_link_checked_out_tweaks
-with_temp_home "link single file" test_link_single_file
-with_temp_home "link single tweak file" test_link_single_tracked_file
-with_temp_home "link home dotfiles" test_link_home_dotfiles
-with_temp_home "link ignores git checkout files" test_link_ignores_git_checkout_files
-with_temp_home "link missing tweak fails" test_link_missing_tweak_fails
-with_temp_home "status reports tweak health" test_status_reports_tweak_health
-with_temp_home "apply command is removed" test_apply_command_removed
-with_temp_home "removed commands are unknown" test_removed_commands_are_unknown
-with_temp_home "remove restores default and deletes tweak" test_remove_restores_default_and_deletes_tweak
-with_temp_home "remove untracked missing target restores default" test_remove_untracked_missing_target_restores_default
-with_temp_home "remove missing original fails" test_remove_missing_original_fails
-with_temp_home "sync copies local defaults and reapplies imports" test_sync_copies_local_defaults_and_reapplies_imports
-with_temp_home "sync dry-run shows diff without writing" test_sync_dry_run_shows_diff_without_writing
-with_temp_home "sync fails without Omarchy config directory" test_sync_missing_omarchy_config_dir_fails
-with_temp_home "sync warns for tweak without original" test_sync_warns_for_tracked_file_without_original
-with_temp_home "wipe restores baselines without deleting tweaks" test_wipe_restores_baselines_without_deleting_tweaks
-with_temp_home "wipe restores home dotfiles" test_wipe_restores_home_dotfiles
-with_temp_home "wipe fails without Omarchy config directory" test_wipe_missing_omarchy_config_dir_fails
-with_temp_home "completion and man assets" test_completion_and_man_assets
-
-echo "${PASS_COUNT} passed, ${FAIL_COUNT} failed"
-
-[ "$FAIL_COUNT" -eq 0 ]
+with_fixture "Quattro root, custom XDG storage, and multiline Lua" test_quattro_root_xdg_and_multiline_lua
+with_fixture "in-place edits fail without data loss" test_in_place_edit_is_lossless_failure
+with_fixture "managed target drift preserves both files" test_managed_target_drift_preserves_both_files
+with_fixture "bashrc mapping and injection-shaped storage path" test_bashrc_mapping_multiline_and_injection_path
+with_fixture "registry path quoting keeps metacharacters literal" test_registry_path_quoting_keeps_metacharacters_literal
+with_fixture "Foot reopens main and validates assembled config" test_foot_reopens_main_and_validates
+with_fixture "retired and unregistered adapters are rejected" test_rejects_retired_and_unregistered_adapters
+with_fixture "inputrc full-file lifecycle" test_inputrc_full_file_lifecycle
+with_fixture "uwsm/default is a full-file adapter" test_uwsm_default_is_full_file
+with_fixture "baseline hashes distinguish upstream change and drift" test_baselines_distinguish_upstream_change_and_drift
+with_fixture "tracked-only sync and wipe leave mirror files alone" test_tracked_only_sync_and_wipe_leave_mirror_alone
+with_fixture "--all requires force and snapshots" test_all_requires_force_and_snapshots
+with_fixture "--all refuses retired tracked files" test_all_refuses_retired_tracked_files
+with_fixture "dry runs create no persistent files" test_dry_runs_create_no_persistent_files
+with_fixture "malformed markers are rejected" test_malformed_markers_are_rejected
+with_fixture "orphaned valid marker is not recaptured" test_orphaned_valid_marker_is_not_recaptured
+with_fixture "symlink destination is rejected" test_symlink_destination_is_rejected_without_touching_referent
+with_fixture "symlink mutation lock is rejected" test_symlink_lock_is_rejected_without_truncating_referent
+with_fixture "bulk preflight failure changes nothing" test_bulk_preflight_failure_changes_nothing
+with_fixture "read-only original and failed restore safety" test_read_only_original_and_failed_remove_restore
+with_fixture "forced link snapshots conflicts" test_force_link_snapshots_conflict
+with_fixture "CLI contract and deprecated preview" test_cli_contract_and_deprecated_preview
+with_fixture "installer is checkout-relative, staged, and versioned" test_install_is_relative_staged_and_versioned
+with_fixture "distribution version and checksum contract" test_distribution_version_and_checksum_contract
+with_fixture "completion preserves spaces" test_completion_preserves_spaces
+with_fixture "compat config override and bash root mapping" test_compat_config_override_and_bash_root
+with_fixture "sibling Quattro checkout contract" test_sibling_quattro_contract
+
+printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
+((FAIL_COUNT == 0))

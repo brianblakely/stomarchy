@@ -1,72 +1,236 @@
-.TH STOMARCHY 1 "May 2026" "stomarchy 0.1.0" "User Commands"
+.TH STOMARCHY 1 "2026-07-26" "stomarchy 0.2.0" "User Commands"
 .SH NAME
-stomarchy \- manage Omarchy config tweaks without replacing the defaults
+stomarchy \- safely preserve append-only Omarchy Quattro customizations
 .SH SYNOPSIS
 .B stomarchy
-.RI COMMAND
+.I COMMAND
 .RI [ OPTIONS ]
 .SH DESCRIPTION
 .B stomarchy
-stores user changes as diff-only runtime tweaks under
-.IR ~/.config/stomarchy
-and imports those tweaks from config files restored from Omarchy defaults.
+stores customization files below
+.IR ${XDG_CONFIG_HOME:-~/.config}/stomarchy
+while always managing live Omarchy targets below
+.IR ~/.config .
+Append-only adapters restore the current Omarchy original and add one marked
+import block. Full-file adapters copy user-owned files without injecting an
+Omarchy baseline or import.
+.PP
+On first
+.BR add ,
+the edited target must contain the matching Omarchy original as an exact byte
+prefix. The remaining EOF suffix is stored verbatim. In-place edits, deletions,
+reordering, and partial rewrites are refused without changing either file.
+Afterward, edit the tracked tweak and use
+.B link
+instead of editing the assembled target.
 .SH COMMANDS
 .TP
-.B add [--dry-run] FILE
-Generate a tweak from FILE by comparing it with the matching Omarchy original.
-Without
-.BR --dry-run ,
-the target file is restored from the Omarchy original and a Stomarchy tweak
-import block is appended.
+.BI "add [-n|--dry-run] " FILE
+Capture an exact EOF suffix, or store a supported full file. The deprecated
+.B --preview
+option is an alias for
+.BR --dry-run .
 .TP
-.B link [FILE]
-Link checked-out tweaks into local target files without recalculating them.
+.BI "link [-n|--dry-run] [--force] [" FILE ]
+Assemble one target or every tracked target. Direct target drift is refused by
+default.
+.B --force
+overrides a conflict after writing a timestamped recovery snapshot.
 .TP
-.B remove FILE
-Delete the matching tweak and restore FILE from the Omarchy original.
+.BI "remove [-n|--dry-run] [--force] [" FILE ]
+Restore append-only targets successfully before deleting their tracked tweaks.
+Full-file targets, including
+.IR ~/.inputrc ,
+are left intact. With no
+.IR FILE ,
+process every tracked tweak.
 .TP
-.B sync [--dry-run]
-Copy current Omarchy originals into local target files and reattach tweak import
-blocks.
-With
-.BR --dry-run ,
-print the changes that would be made without writing files.
+.B sync [-n|--dry-run] [--all] [--force]
+Refresh tracked targets from current Omarchy originals and retain imports.
+The default is tracked-only.
+.B --all
+covers the complete Quattro config mirror and requires
+.BR --force .
 .TP
-.B wipe
-Restore every local target with a current Omarchy original back to the baseline
-Omarchy file, without appending tweak imports. Tracked tweaks are left intact.
+.B wipe [-n|--dry-run] [--all] [--force]
+Restore tracked append-only targets without imports while retaining tweak
+files. User-owned full-file targets are left intact. The default is
+tracked-only;
+.B --all
+requires
+.BR --force .
 .TP
-.B status
-Show tweak health, including linked, unlinked, stale, no-op, unsupported, and
-missing-original states.
-.SH FILES
+.B status [--check] [--porcelain]
+List tracked files in deterministic order.
+.B --check
+returns a failure status for actionable problems.
+.B --porcelain
+prints a target, a tab, and comma-separated tags.
 .TP
-.I ~/.config/stomarchy
-Directory containing tracked tweaks.
+.BI "help [" COMMAND ]
+Show general or command-specific help.
+.SH ADAPTERS
+.SS Append-only overlays
 .TP
-.I ~/.local/share/omarchy/config
-Default Omarchy config mirror used as the comparison and restore source.
+.B hypr/*.lua
+Loaded with
+.BR dofile() .
+The captured suffix must pass
+.B luac -p
+as a standalone EOF chunk. Quattro exposes the global
+.B hl
+and
+.B o
+APIs to these chunks.
+.TP
+.B ghostty/config
+Loaded with
+.BR config-file .
+.TP
+.B kitty/*.conf
+Loaded with
+.BR include .
+.TP
+.B tmux/*.conf
+Loaded with
+.BR source-file .
+.TP
+.B foot/*.ini
+Loaded with
+.BR include .
+Stomarchy reopens
+.B [main]
+before the directive and checks the assembled target with
+.BR "foot -C" .
+.TP
+.B ~/.bashrc
+Loaded with Bash
+.BR source .
+Its Omarchy original is
+.IR $OMARCHY_ROOT/default/bashrc ,
+where
+.I OMARCHY_ROOT
+means the source root selected by the resolution order below.
+.SS Full-file tracking
+.TP
+.B ~/.inputrc
+Stored and restored as a complete user-owned file. No
+.B $include
+or Omarchy baseline is injected.
+.TP
+.B ~/.config/uwsm/default
+Stored and restored as Quattro's optional complete user-owned file.
+.PP
+Hyprland
+.BR *.conf ,
+.IR uwsm/env ,
+arbitrary
+.BR *.sh ,
+and every unregistered format are refused.
+.SH CONFLICTS AND RECOVERY
+Hashes below
+.IR ${XDG_STATE_HOME:-~/.local/state}/stomarchy
+record the Omarchy original, assembled target, and tweak. They distinguish an
+upstream Omarchy change from a direct edit to a managed target.
+.PP
+Forced writes save affected targets and tweaks below a timestamped
+.I recovery
+directory in the state directory before replacement. Ordinary tracked
+operations rely on conflict detection and atomic replacement and do not make
+unconditional backups.
+.SH STATUS TAGS
+.TP
+.B linked
+The target exactly matches its expected assembled or full-file content.
+.TP
+.B no-op
+An append-only tweak is empty.
+.TP
+.B tweak-changed
+The tracked tweak changed while the managed target remained untouched; run
+.BR link .
+.TP
+.B upstream-changed
+The Omarchy original changed while the managed target remained untouched; run
+.BR sync .
+.TP
+.B unlinked
+The target is an unassembled baseline or a full file has not been copied.
+.TP
+.B drift
+The live target was edited directly and will not be overwritten without
+.BR --force .
+.TP
+.BR missing-target ", " missing-original ", " unsupported ", " invalid-tweak
+.TQ
+.BR malformed-markers ", " invalid-baseline ", " unsafe-target ", " unsafe-tweak
+Actionable safety or compatibility failures.
 .SH ENVIRONMENT
 .TP
-.B XDG_CONFIG_HOME
-Overrides the user's config directory. Defaults to
-.IR ~/.config .
+.B STOMARCHY_OMARCHY_ROOT
+Highest-priority Omarchy source root override.
+.TP
+.B OMARCHY_PATH
+Production Omarchy source root when no Stomarchy-specific override is set.
 .TP
 .B STOMARCHY_OMARCHY_CONFIG_DIR
-Overrides the Omarchy original config directory.
+Compatibility override for only the Omarchy
+.I config
+mirror. When no root variable is set, its parent is treated as the Omarchy
+root.
+.TP
+.B XDG_CONFIG_HOME
+Controls Stomarchy repository storage only. Live targets remain below
+.IR ~/.config .
+.TP
+.B XDG_STATE_HOME
+Controls baseline hashes, the mutation lock, and recovery snapshots.
+.TP
+.B NO_COLOR
+Disables colored diagnostics when present. Color is also disabled off a TTY.
+.SH OMARCHY RESOLUTION
+The source root is selected in this order:
+.BR STOMARCHY_OMARCHY_ROOT ,
+.BR OMARCHY_PATH ,
+.IR /usr/share/omarchy ,
+then
+.IR ~/.local/share/omarchy .
+Trailing slashes and lexical path components are normalized.
+.SH EXIT STATUS
+.TP
+.B 0
+The command succeeded and
+.B status --check
+found no actionable problems.
+.TP
+.B 1
+An operational, validation, conflict, or status-check failure occurred.
+.TP
+.B 2
+Command-line usage was invalid.
+.TP
+.B 130, 143
+The process was interrupted by SIGINT or SIGTERM.
 .SH EXAMPLES
+.nf
+STOMARCHY_OMARCHY_ROOT=~/Projects/omarchy stomarchy status
+stomarchy add -n ~/.config/hypr/bindings.lua
+stomarchy add ~/.config/hypr/bindings.lua
+$EDITOR ~/.config/stomarchy/.config/hypr/bindings.lua
+stomarchy link
+stomarchy sync --dry-run
+stomarchy wipe
+stomarchy sync --all --force
+.fi
+.SH FILES
 .TP
-Preview a tweak:
-.B stomarchy add --dry-run ~/.config/hypr/hyprland.conf
+.I ${XDG_CONFIG_HOME:-~/.config}/stomarchy
+Version-controllable tracked tweaks.
 .TP
-Track and wire a tweak:
-.B stomarchy add ~/.config/hypr/hyprland.conf
-.TP
-Preview an Omarchy sync:
-.B stomarchy sync --dry-run
-.TP
-Return local targets to Omarchy baselines:
-.B stomarchy wipe
+.I ${XDG_STATE_HOME:-~/.local/state}/stomarchy
+Machine-local hashes, mutation lock, and recovery snapshots.
 .SH SEE ALSO
 .BR bash (1),
-.BR diff (1)
+.BR flock (1),
+.BR foot (1),
+.BR lua (1)
