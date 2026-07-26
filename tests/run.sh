@@ -264,7 +264,7 @@ test_foot_reopens_main_and_validates() {
     printf 'lines=1000\n'
   } >"$original"
   cp "$original" "$target"
-  printf '\n[colors-dark]\nalpha=0.95\n' >>"$target"
+  printf '\n[cursor]\nstyle=beam\n' >>"$target"
 
   run_stomarchy add "$target"
   assert_contains "$target" "# BEGIN Stomarchy tweaks"
