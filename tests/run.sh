@@ -690,7 +690,7 @@ test_compat_config_override_and_bash_root() {
 }
 
 test_sibling_quattro_contract() {
-  local quattro=${STOMARCHY_QUATTRO_CHECKOUT:-/home/alex/Projects/omarchy}
+  local quattro=${STOMARCHY_QUATTRO_CHECKOUT:-"$ROOT_DIR/../omarchy"}
   local target
   local tracked
 
